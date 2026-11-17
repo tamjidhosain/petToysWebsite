@@ -1043,14 +1043,14 @@ function Invoke-AutoMenu {
             if (-not (Test-IsAdmin)) { Write-Host '  This needs Administrator rights. Run RamCleaner.bat and click Yes.' -ForegroundColor Yellow; return }
             $t = Read-Number 'Clean when RAM use goes above what %?' 85 50 98
             $i = Read-Number 'Check every how many seconds?' 60 15 3600
-            $script = $PSCommandPath
+            $scriptFile = $PSCommandPath
             Write-Host ''
-            Write-Host ("  The background task will run this file: {0}" -f $script) -ForegroundColor Yellow
+            Write-Host ("  The background task will run this file: {0}" -f $scriptFile) -ForegroundColor Yellow
             Write-Host '  Keep the folder there - if you move or delete it (or switch git branch), auto-clean stops working.' -ForegroundColor Yellow
             try {
                 $user = "$env:USERDOMAIN\$env:USERNAME"
                 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
-                    '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Auto -Threshold {1} -Interval {2}' -f $script, $t, $i)
+                    '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Auto -Threshold {1} -Interval {2}' -f $scriptFile, $t, $i)
                 $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
                 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
                 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `

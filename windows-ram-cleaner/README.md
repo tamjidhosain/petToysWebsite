@@ -24,6 +24,8 @@ A small, dependency-free tool (PowerShell + a .bat launcher) to free up RAM and 
 | 7. Close a program (CPU) | Pick a program from the CPU list to close it. |
 | 8. Clean temp files | Deletes leftover temporary files (your user Temp folder, plus `C:\Windows\Temp` when run as admin). Files in use are skipped. |
 | 9. Startup apps | Opens Windows Settings → Startup apps so you can stop programs from loading at boot. |
+| A. Auto-clean | Keeps RAM low automatically: trims memory whenever usage passes a threshold (default 85%). Run it in a window, or turn it on to run hidden in the background every time Windows starts (admin). Log: `%LOCALAPPDATA%\RamCleaner\auto-clean.log`. |
+| L. Leak finder | Watches for a few minutes while the PC is idle and shows which programs (or drivers) keep growing - the real cause when RAM fills up on its own. |
 | U. Uninstall apps | Search installed apps (desktop + Microsoft Store), then remove one silently and clean up its leftovers. See below. |
 
 The header also shows live RAM and CPU usage bars; press **R** to refresh them.
@@ -46,6 +48,7 @@ Tip: close your browser before uninstalling - while the uninstaller runs, any *n
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\RamCleaner.ps1 -Quick   # quick clean, then exit
 powershell -ExecutionPolicy Bypass -File .\RamCleaner.ps1 -Deep    # deep clean (run as admin), then exit
+powershell -ExecutionPolicy Bypass -File .\RamCleaner.ps1 -Auto -Threshold 85 -Interval 60   # keep cleaning automatically
 ```
 
 You can add the `-Deep` command to Task Scheduler with "Run with highest privileges" to run it automatically.

@@ -24,7 +24,10 @@
 [CmdletBinding()]
 param(
     [switch]$Quick,   # run Quick Clean and exit
-    [switch]$Deep     # run Deep Clean and exit (requires Admin)
+    [switch]$Deep,    # run Deep Clean and exit (requires Admin)
+    [switch]$Auto,    # keep running and clean whenever RAM use passes -Threshold
+    [int]$Threshold = 85,
+    [int]$Interval = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -954,6 +957,212 @@ function Invoke-Uninstaller {
     Remove-Leftovers $items
 }
 
+# ---------------------------------------------------------------------------
+# Auto-clean (keeps RAM low automatically)
+# ---------------------------------------------------------------------------
+$script:AutoTaskName = 'RAM Cleaner Auto'
+$script:AutoLog = Join-Path $env:LOCALAPPDATA 'RamCleaner\auto-clean.log'
+
+function Invoke-TrimAll {
+    [void][RamTools]::EnablePrivilege('SeDebugPrivilege')
+    $n = 0
+    foreach ($p in Get-Process) {
+        if ($p.Id -le 4) { continue }
+        if ([RamTools]::TrimProcess($p.Id)) { $n++ }
+    }
+    return $n
+}
+
+function Write-AutoLog([string]$line) {
+    try {
+        $dir = Split-Path $script:AutoLog -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if ((Test-Path $script:AutoLog) -and (Get-Item $script:AutoLog).Length -gt 1MB) {
+            Get-Content $script:AutoLog -Tail 500 | Set-Content ($script:AutoLog + '.tmp')
+            Move-Item ($script:AutoLog + '.tmp') $script:AutoLog -Force
+        }
+        Add-Content -Path $script:AutoLog -Value $line
+    } catch { }
+}
+
+function Start-AutoClean([int]$threshold, [int]$interval, [bool]$background) {
+    if (-not $background) {
+        Write-Host ''
+        Write-Host ("  Auto-clean running: cleans whenever RAM use goes above {0}%, checks every {1} seconds." -f $threshold, $interval) -ForegroundColor Cyan
+        Write-Host '  Leave this window open (you can minimise it). Press Ctrl+C to stop.' -ForegroundColor DarkGray
+        Write-Host ''
+    } else {
+        Write-AutoLog ("{0:yyyy-MM-dd HH:mm:ss}  Auto-clean started (threshold {1}%, every {2}s)" -f (Get-Date), $threshold, $interval)
+    }
+    while ($true) {
+        try {
+            $m = Get-MemoryInfo
+            if ($m.Percent -ge $threshold) {
+                $before = $m.Available
+                $n = Invoke-TrimAll
+                Start-Sleep -Seconds 1
+                $after = Get-MemoryInfo
+                $line = "{0:yyyy-MM-dd HH:mm:ss}  {1}% used -> trimmed {2} programs, freed {3}, now {4}% used" -f (Get-Date),
+                    $m.Percent, $n, (Format-Size ([math]::Max(0, $after.Available - $before))), $after.Percent
+                if ($background) { Write-AutoLog $line } else { Write-Host ('  ' + $line) -ForegroundColor Green }
+            } elseif (-not $background) {
+                Write-Host ("  {0:HH:mm:ss}  {1}% used - OK" -f (Get-Date), $m.Percent) -ForegroundColor DarkGray
+            }
+        } catch { }
+        Start-Sleep -Seconds $interval
+    }
+}
+
+function Read-Number([string]$prompt, [int]$default, [int]$min, [int]$max) {
+    $v = Read-Host ("  {0} (default {1})" -f $prompt, $default)
+    $n = 0
+    if ([int]::TryParse($v, [ref]$n) -and $n -ge $min -and $n -le $max) { return $n }
+    return $default
+}
+
+function Invoke-AutoMenu {
+    $task = $null
+    try { $task = Get-ScheduledTask -TaskName $script:AutoTaskName -ErrorAction Stop } catch { }
+    Write-Host ''
+    Write-Host '  AUTO-CLEAN' -ForegroundColor Cyan
+    if ($task) { Write-Host ("  Background auto-clean at startup: ON ({0})" -f $task.State) -ForegroundColor Green }
+    else       { Write-Host '  Background auto-clean at startup: OFF' -ForegroundColor Yellow }
+    Write-Host ''
+    Write-Host '  1) Run auto-clean now in this window'
+    Write-Host '  2) Turn ON - run hidden in the background every time Windows starts [Admin]'
+    Write-Host '  3) Turn OFF background auto-clean'
+    Write-Host '  4) View the auto-clean log'
+    $c = Read-Host '  Choose (blank = back)'
+    switch ($c) {
+        '1' {
+            $t = Read-Number 'Clean when RAM use goes above what %?' 85 50 98
+            $i = Read-Number 'Check every how many seconds?' 60 15 3600
+            Start-AutoClean $t $i $false
+        }
+        '2' {
+            if (-not (Test-IsAdmin)) { Write-Host '  This needs Administrator rights. Run RamCleaner.bat and click Yes.' -ForegroundColor Yellow; return }
+            $t = Read-Number 'Clean when RAM use goes above what %?' 85 50 98
+            $i = Read-Number 'Check every how many seconds?' 60 15 3600
+            $script = $PSCommandPath
+            Write-Host ''
+            Write-Host ("  The background task will run this file: {0}" -f $script) -ForegroundColor Yellow
+            Write-Host '  Keep the folder there - if you move or delete it (or switch git branch), auto-clean stops working.' -ForegroundColor Yellow
+            try {
+                $user = "$env:USERDOMAIN\$env:USERNAME"
+                $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
+                    '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Auto -Threshold {1} -Interval {2}' -f $script, $t, $i)
+                $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
+                $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+                $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                                -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+                Register-ScheduledTask -TaskName $script:AutoTaskName -Action $action -Trigger $trigger `
+                    -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskName $script:AutoTaskName
+                Write-Host ("  [OK]   Auto-clean is ON. It is running now and will start with Windows (above {0}%, every {1}s)." -f $t, $i) -ForegroundColor Green
+            } catch {
+                Write-Host ("  [FAIL] {0}" -f $_.Exception.Message) -ForegroundColor Red
+            }
+        }
+        '3' {
+            if (-not $task) { Write-Host '  It is already off.'; return }
+            try {
+                Stop-ScheduledTask -TaskName $script:AutoTaskName -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName $script:AutoTaskName -Confirm:$false -ErrorAction Stop
+                Write-Host '  [OK]   Background auto-clean turned off.' -ForegroundColor Green
+            } catch {
+                Write-Host ("  [FAIL] {0} (try running as Administrator)" -f $_.Exception.Message) -ForegroundColor Red
+            }
+        }
+        '4' {
+            if (Test-Path $script:AutoLog) { Get-Content $script:AutoLog -Tail 30 | ForEach-Object { Write-Host ('  ' + $_) } }
+            else { Write-Host '  No log yet.' }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Leak finder: shows which programs keep growing while you're not using them
+# ---------------------------------------------------------------------------
+function Get-PoolInfo {
+    try {
+        $m = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+        return [pscustomobject]@{ NonPaged = [double]$m.PoolNonpagedBytes; Paged = [double]$m.PoolPagedBytes }
+    } catch { return $null }
+}
+
+function Get-PrivateSnapshot {
+    $h = @{}
+    foreach ($p in Get-Process) {
+        if ($p.Id -le 4) { continue }
+        try { $h[$p.Id] = [pscustomobject]@{ Name = $p.ProcessName; Bytes = [double]$p.PrivateMemorySize64 } } catch { }
+    }
+    return $h
+}
+
+function Invoke-LeakFinder {
+    $mins = Read-Number 'How many minutes should I watch? Leave the PC idle meanwhile.' 3 1 60
+    $startMem = Get-MemoryInfo
+    $startPool = Get-PoolInfo
+    $start = Get-PrivateSnapshot
+    $end = (Get-Date).AddMinutes($mins)
+    while ((Get-Date) -lt $end) {
+        $left = [int]($end - (Get-Date)).TotalSeconds
+        Write-Progress -Activity 'Watching memory use' -Status ("{0}s left - RAM {1}% used" -f $left, (Get-MemoryInfo).Percent) `
+            -PercentComplete ([math]::Min(100, 100 - ($left / ($mins * 60) * 100)))
+        Start-Sleep -Seconds 5
+    }
+    Write-Progress -Activity 'Watching memory use' -Completed
+    $now = Get-PrivateSnapshot
+    $endMem = Get-MemoryInfo
+    $endPool = Get-PoolInfo
+
+    $growth = @{}
+    foreach ($id in $now.Keys) {
+        $n = $now[$id].Name
+        if (-not $growth.ContainsKey($n)) { $growth[$n] = [pscustomobject]@{ Name = $n; Start = 0.0; End = 0.0; New = 0 } }
+        $g = $growth[$n]
+        $g.End += $now[$id].Bytes
+        if ($start.ContainsKey($id)) { $g.Start += $start[$id].Bytes } else { $g.New++ }
+    }
+    foreach ($id in $start.Keys) {   # processes that exited
+        $n = $start[$id].Name
+        if (-not $now.ContainsKey($id) -and $growth.ContainsKey($n)) { $growth[$n].Start += $start[$id].Bytes }
+    }
+    $top = @($growth.Values | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; Start = $_.Start; End = $_.End; Grow = $_.End - $_.Start; New = $_.New }
+    } | Where-Object { $_.Grow -gt 5MB } | Sort-Object Grow -Descending | Select-Object -First 12)
+
+    Write-Host ''
+    Write-Host ("  RAM use went from {0}% to {1}% in {2} minute(s)." -f $startMem.Percent, $endMem.Percent, $mins) -ForegroundColor Cyan
+    Write-Host ''
+    if ($top.Count -eq 0) {
+        Write-Host '  No program grew by more than 5 MB. Nothing is leaking - the RAM going back up is just' -ForegroundColor Green
+        Write-Host '  Windows reloading the memory that was trimmed, which is normal.' -ForegroundColor Green
+    } else {
+        Write-Host '  PROGRAMS THAT GREW (private memory they reserved)' -ForegroundColor Cyan
+        Write-Host ('  {0,-30} {1,11} {2,11} {3,11} {4,11}' -f 'Program', 'Before', 'After', 'Growth', 'Per min')
+        Write-Host ('  ' + ('-' * 78)) -ForegroundColor DarkGray
+        foreach ($r in $top) {
+            $color = if ($r.Grow -ge 200MB) { 'Red' } elseif ($r.Grow -ge 50MB) { 'Yellow' } else { 'Gray' }
+            $note = ''
+            if ($r.New -gt 0) { $note = " (+{0} new)" -f $r.New }
+            Write-Host ('  {0,-30} {1,11} {2,11} {3,11} {4,11}{5}' -f (Limit-Text $r.Name 30), (Format-Size $r.Start), (Format-Size $r.End),
+                ('+' + (Format-Size $r.Grow)), (Format-Size ($r.Grow / $mins)), $note) -ForegroundColor $color
+        }
+        Write-Host ''
+        Write-Host '  Programs in red/yellow that keep growing while idle are likely leaking memory.' -ForegroundColor DarkGray
+        Write-Host '  Fix: update them, restart them now and then, or uninstall them (option U).' -ForegroundColor DarkGray
+    }
+    if ($startPool -and $endPool) {
+        Write-Host ''
+        Write-Host ("  Driver memory (non-paged pool): {0} -> {1}" -f (Format-Size $startPool.NonPaged), (Format-Size $endPool.NonPaged))
+        if ($endPool.NonPaged -gt 1GB -or ($endPool.NonPaged - $startPool.NonPaged) -gt 50MB) {
+            Write-Host '  This is high or growing - a driver is probably leaking memory (often network, audio,' -ForegroundColor Red
+            Write-Host '  RGB/lighting or antivirus drivers). Update your network and chipset drivers first.' -ForegroundColor Red
+        }
+    }
+}
+
 function Pause-Menu {
     Write-Host ''
     [void](Read-Host '  Press Enter to return to the menu')
@@ -962,6 +1171,7 @@ function Pause-Menu {
 # ---------------------------------------------------------------------------
 # Non-interactive mode
 # ---------------------------------------------------------------------------
+if ($Auto)  { Start-AutoClean $Threshold $Interval $true; exit }
 if ($Deep)  { Invoke-QuickClean; Invoke-DeepClean; exit }
 if ($Quick) { Invoke-QuickClean; exit }
 
@@ -996,6 +1206,8 @@ while ($true) {
     Write-Host '  8) Clean temporary files'
     Write-Host '  9) Manage startup apps (stop apps loading at boot)'
     Write-Host '  U) Uninstall apps (silent, blocks pop-ups, removes leftovers)'
+    Write-Host '  A) Auto-clean (keep RAM low automatically)'
+    Write-Host '  L) Find what keeps filling RAM (leak finder)'
     Write-Host '  R) Refresh'
     Write-Host '  0) Exit'
     Write-Host ''
@@ -1011,6 +1223,8 @@ while ($true) {
         '8' { Invoke-TempClean; Pause-Menu }
         '9' { Start-Process 'ms-settings:startupapps'; Pause-Menu }
         'U' { Invoke-Uninstaller; Pause-Menu }
+        'A' { Invoke-AutoMenu; Pause-Menu }
+        'L' { Invoke-LeakFinder; Pause-Menu }
         '0' { exit }
         default { }
     }

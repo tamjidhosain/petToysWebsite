@@ -26,7 +26,7 @@ param(
     [switch]$Quick,   # run Quick Clean and exit
     [switch]$Deep,    # run Deep Clean and exit (requires Admin)
     [switch]$Auto,    # keep running and clean whenever RAM use passes -Threshold
-    [int]$Threshold = 85,
+    [int]$Threshold = 60,
     [int]$Interval = 60
 )
 
@@ -256,46 +256,194 @@ function Report-Freed([double]$before, [double]$after) {
 }
 
 # ---------------------------------------------------------------------------
-# Shared: pick a program from a list and close it
+# Checkbox picker window (tick several items, then click the button)
 # ---------------------------------------------------------------------------
 $script:CriticalProcesses = 'csrss','wininit','winlogon','services','lsass','smss','svchost','System',
     'Registry','dwm','explorer','MsMpEng','fontdrvhost','Memory Compression','powershell','pwsh',
     'conhost','audiodg','sihost','ctfmon','spoolsv','WmiPrvSE','Idle','Secure System'
 
-function Select-FromList($list, [string]$action) {
+# Text fallback: accepts "1,3,5-8" or "all"
+function Read-MultiSelection($Headers, $Rows) {
     Write-Host ''
-    $choice = Read-Host ("  Enter the # of the program to {0} (blank to cancel)" -f $action)
-    if ([string]::IsNullOrWhiteSpace($choice)) { return $null }
-    $n = 0
-    if (-not [int]::TryParse($choice, [ref]$n) -or $n -lt 1 -or $n -gt $list.Count) {
-        Write-Host '  Invalid choice.' -ForegroundColor Yellow; return $null
+    Write-Host ('  {0,-4} {1}' -f '#', ($Headers -join '  |  ')) -ForegroundColor Cyan
+    for ($i = 0; $i -lt $Rows.Count; $i++) { Write-Host ('  {0,-4} {1}' -f ($i + 1), ($Rows[$i] -join '  |  ')) }
+    $s = Read-Host '  Enter numbers to select, e.g. 1,3,5-8 (ALL = everything, blank = cancel)'
+    if ([string]::IsNullOrWhiteSpace($s)) { return @() }
+    if ($s.Trim() -ieq 'all') { return @(0..($Rows.Count - 1)) }
+    $sel = @{}
+    foreach ($part in $s -split '[,\s]+') {
+        if ($part -match '^(\d+)-(\d+)$') { foreach ($n in [int]$Matches[1]..[int]$Matches[2]) { $sel[$n - 1] = $true } }
+        elseif ($part -match '^\d+$') { $sel[[int]$part - 1] = $true }
     }
-    $target = $list[$n - 1]
-    if ($script:CriticalProcesses -contains $target.Name) {
-        Write-Host ("  '{0}' is a Windows system process and should not be touched." -f $target.Name) -ForegroundColor Red
-        return $null
-    }
-    return $target
+    return @($sel.Keys | Where-Object { $_ -ge 0 -and $_ -lt $Rows.Count } | Sort-Object)
 }
 
-function Stop-ProgramGroup($target) {
-    Write-Host ("  This will close ALL {0} '{1}' window(s)/process(es). Unsaved work will be lost." -f $target.Instances, $target.Name) -ForegroundColor Yellow
+# Shows a window with a checkbox list + search box. Returns the indexes of the ticked rows.
+function Show-Picker {
+    param([string]$Title, [string[]]$Headers, [int[]]$Widths, [object[]]$Rows,
+          [string]$OkText = 'OK', [bool]$CheckAll = $false, [string]$Hint = '')
+    if (-not $Rows -or $Rows.Count -eq 0) { return @() }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    } catch {
+        return Read-MultiSelection $Headers $Rows
+    }
+    [Windows.Forms.Application]::EnableVisualStyles()
+
+    $state = @{ Checked = @{}; Loading = $false }
+    for ($i = 0; $i -lt $Rows.Count; $i++) { $state.Checked[$i] = $CheckAll }
+
+    $form = New-Object Windows.Forms.Form
+    $form.Text = $Title
+    $form.Size = New-Object Drawing.Size(900, 640)
+    $form.MinimumSize = New-Object Drawing.Size(600, 400)
+    $form.StartPosition = 'CenterScreen'
+    $form.TopMost = $true
+    $form.Font = New-Object Drawing.Font('Segoe UI', 9.5)
+
+    $top = New-Object Windows.Forms.Panel
+    $top.Dock = 'Top'; $top.Height = 64
+    $hintLbl = New-Object Windows.Forms.Label
+    $hintLbl.Text = $(if ($Hint) { $Hint } else { 'Tick the boxes (or click a row), then press the button at the bottom.' })
+    $hintLbl.AutoSize = $true; $hintLbl.Location = New-Object Drawing.Point(10, 8)
+    $lbl = New-Object Windows.Forms.Label
+    $lbl.Text = 'Search:'; $lbl.AutoSize = $true; $lbl.Location = New-Object Drawing.Point(10, 37)
+    $search = New-Object Windows.Forms.TextBox
+    $search.Location = New-Object Drawing.Point(68, 33); $search.Width = 320
+    $countLbl = New-Object Windows.Forms.Label
+    $countLbl.AutoSize = $true; $countLbl.Location = New-Object Drawing.Point(405, 37)
+    $countLbl.Font = New-Object Drawing.Font('Segoe UI', 9.5, [Drawing.FontStyle]::Bold)
+    $top.Controls.AddRange(@($hintLbl, $lbl, $search, $countLbl))
+
+    $bottom = New-Object Windows.Forms.Panel
+    $bottom.Dock = 'Bottom'; $bottom.Height = 52
+    $bottom.Width = $form.ClientSize.Width
+    $btnAll = New-Object Windows.Forms.Button
+    $btnAll.Text = 'Select all'; $btnAll.Size = New-Object Drawing.Size(105, 32); $btnAll.Location = New-Object Drawing.Point(10, 10)
+    $btnNone = New-Object Windows.Forms.Button
+    $btnNone.Text = 'Select none'; $btnNone.Size = New-Object Drawing.Size(105, 32); $btnNone.Location = New-Object Drawing.Point(122, 10)
+    $btnCancel = New-Object Windows.Forms.Button
+    $btnCancel.Text = 'Cancel'; $btnCancel.Size = New-Object Drawing.Size(95, 32)
+    $btnCancel.Location = New-Object Drawing.Point(($bottom.Width - 105), 10); $btnCancel.Anchor = 'Top, Right'
+    $btnCancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $btnOk = New-Object Windows.Forms.Button
+    $btnOk.Text = $OkText; $btnOk.Size = New-Object Drawing.Size(170, 32)
+    $btnOk.Location = New-Object Drawing.Point(($bottom.Width - 285), 10); $btnOk.Anchor = 'Top, Right'
+    $btnOk.Font = New-Object Drawing.Font('Segoe UI', 9.5, [Drawing.FontStyle]::Bold)
+    $btnOk.DialogResult = [Windows.Forms.DialogResult]::OK
+    $bottom.Controls.AddRange(@($btnAll, $btnNone, $btnOk, $btnCancel))
+
+    $lv = New-Object Windows.Forms.ListView
+    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true
+    $lv.GridLines = $true; $lv.MultiSelect = $false; $lv.HideSelection = $false
+    for ($c = 0; $c -lt $Headers.Count; $c++) {
+        $w = 150
+        if ($Widths -and $c -lt $Widths.Count) { $w = $Widths[$c] }
+        [void]$lv.Columns.Add($Headers[$c], $w)
+    }
+
+    $form.Controls.Add($lv)
+    $form.Controls.Add($top)
+    $form.Controls.Add($bottom)
+    $lv.BringToFront()
+    $form.CancelButton = $btnCancel
+
+    $updateCount = {
+        $n = @($state.Checked.Values | Where-Object { $_ }).Count
+        $countLbl.Text = "$n selected"
+        $btnOk.Enabled = ($n -gt 0)
+    }
+    $refresh = {
+        $state.Loading = $true
+        $lv.BeginUpdate()
+        $lv.Items.Clear()
+        $q = $search.Text.Trim()
+        for ($i = 0; $i -lt $Rows.Count; $i++) {
+            $r = @($Rows[$i])
+            if ($q -and (($r -join ' ').IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -lt 0)) { continue }
+            $li = New-Object Windows.Forms.ListViewItem([string]$r[0])
+            for ($c = 1; $c -lt $r.Count; $c++) { [void]$li.SubItems.Add([string]$r[$c]) }
+            $li.Tag = $i
+            $li.Checked = [bool]$state.Checked[$i]
+            [void]$lv.Items.Add($li)
+        }
+        $lv.EndUpdate()
+        $state.Loading = $false
+        & $updateCount
+    }
+    $setVisible = {
+        param([bool]$value)
+        $state.Loading = $true
+        foreach ($li in $lv.Items) { $li.Checked = $value; $state.Checked[[int]$li.Tag] = $value }
+        $state.Loading = $false
+        & $updateCount
+    }
+
+    $search.Add_TextChanged({ & $refresh })
+    $lv.Add_ItemChecked({
+        param($s, $e)
+        if (-not $state.Loading) { $state.Checked[[int]$e.Item.Tag] = $e.Item.Checked; & $updateCount }
+    })
+    $lv.Add_MouseClick({
+        param($s, $e)
+        $hit = $lv.HitTest($e.Location)
+        if ($hit.Item -and $hit.Location -ne [Windows.Forms.ListViewHitTestLocations]::StateImage) {
+            $hit.Item.Checked = -not $hit.Item.Checked
+        }
+    })
+    # A double-click would otherwise undo the single-click toggle
+    $lv.Add_MouseDoubleClick({
+        param($s, $e)
+        $hit = $lv.HitTest($e.Location)
+        if ($hit.Item -and $hit.Location -ne [Windows.Forms.ListViewHitTestLocations]::StateImage) {
+            $hit.Item.Checked = -not $hit.Item.Checked
+        }
+    })
+    $btnAll.Add_Click({ & $setVisible $true })
+    $btnNone.Add_Click({ & $setVisible $false })
+    $form.Add_Shown({ $form.Activate(); [void]$search.Focus() })
+
+    & $refresh
+    $result = $form.ShowDialog()
+    $form.Dispose()
+    if ($result -ne [Windows.Forms.DialogResult]::OK) { return @() }
+    return @($state.Checked.Keys | Where-Object { $state.Checked[$_] } | Sort-Object)
+}
+
+# Lets the user tick programs from a list (system processes are hidden).
+function Select-Programs($list, [string]$title, [string]$valueHeader, [scriptblock]$valueText, [string]$okText) {
+    $list = @($list | Where-Object { $script:CriticalProcesses -notcontains $_.Name })
+    $rows = @(foreach ($p in $list) { , @($p.Name, [string]$p.Instances, [string](& $valueText $p)) })
+    $idx = @(Show-Picker -Title $title -Headers @('Program', 'Windows/processes', $valueHeader) -Widths @(420, 140, 140) `
+                -Rows $rows -OkText $okText)
+    return @(foreach ($i in $idx) { $list[$i] })
+}
+
+function Stop-ProgramGroups($targets) {
+    $targets = @($targets)
+    if ($targets.Count -eq 0) { Write-Host '  Nothing selected.'; return $false }
+    Write-Host ''
+    Write-Host '  These programs will be closed (unsaved work in them will be lost):' -ForegroundColor Yellow
+    foreach ($t in $targets) { Write-Host ("   - {0}  ({1} process(es))" -f $t.Name, $t.Instances) }
     $confirm = Read-Host '  Type Y to confirm'
     if ($confirm -notmatch '^[Yy]') { Write-Host '  Cancelled.'; return $false }
-    foreach ($id in $target.Ids) {
-        try { Stop-Process -Id $id -Force -ErrorAction Stop } catch { }
+    foreach ($t in $targets) {
+        foreach ($id in $t.Ids) { try { Stop-Process -Id $id -Force -ErrorAction Stop } catch { } }
+        Write-Host ("  [OK]   Closed {0}" -f $t.Name) -ForegroundColor Green
     }
     Start-Sleep -Seconds 1
-    Write-Host ("  Closed '{0}'." -f $target.Name) -ForegroundColor Green
     return $true
 }
 
 function Invoke-CloseProgram {
-    $list = @(Show-TopProcesses 20)
-    $target = Select-FromList $list 'close'
-    if (-not $target) { return }
+    Write-Host ''
+    Write-Host '  Opening the program list window...' -ForegroundColor DarkGray
+    $list = @(Get-TopProcesses 60)
+    $sel = @(Select-Programs $list 'Close programs to free RAM' 'RAM' { param($p) Format-Size $p.Memory } 'Close selected')
+    if ($sel.Count -eq 0) { Write-Host '  Nothing selected.'; return }
     $before = (Get-MemoryInfo).Available
-    if (Stop-ProgramGroup $target) { Report-Freed $before (Get-MemoryInfo).Available }
+    if (Stop-ProgramGroups $sel) { Report-Freed $before (Get-MemoryInfo).Available }
 }
 
 # ---------------------------------------------------------------------------
@@ -368,9 +516,11 @@ function Show-TopCpuProcesses([int]$count = 15) {
 }
 
 function Invoke-LowerPriority {
-    $list = @(Show-TopCpuProcesses 20)
-    $target = Select-FromList $list 'change priority of'
-    if (-not $target) { return }
+    Write-Host ''
+    Write-Host '  Measuring CPU usage for 1.5 seconds...' -ForegroundColor DarkGray
+    $list = @(Get-TopCpuProcesses 60)
+    $sel = @(Select-Programs $list 'Lower the priority of CPU-heavy programs' 'CPU %' { param($p) "$($p.Cpu)%" } 'Change priority')
+    if ($sel.Count -eq 0) { Write-Host '  Nothing selected.'; return }
     Write-Host ''
     Write-Host '  1) Below Normal  (gives other apps more CPU - recommended)'
     Write-Host '  2) Idle / Low    (only runs when the CPU is otherwise free)'
@@ -378,19 +528,22 @@ function Invoke-LowerPriority {
     $p = Read-Host '  Choose priority'
     $class = switch ($p) { '1' { 'BelowNormal' } '2' { 'Idle' } '3' { 'Normal' } default { $null } }
     if (-not $class) { Write-Host '  Cancelled.'; return }
-    $ok = 0; $fail = 0
-    foreach ($id in $target.Ids) {
-        try { (Get-Process -Id $id -ErrorAction Stop).PriorityClass = $class; $ok++ } catch { $fail++ }
+    foreach ($t in $sel) {
+        $ok = 0; $fail = 0
+        foreach ($id in $t.Ids) {
+            try { (Get-Process -Id $id -ErrorAction Stop).PriorityClass = $class; $ok++ } catch { $fail++ }
+        }
+        Write-Host ("  [OK]   {0} -> {1} ({2} changed, {3} failed)" -f $t.Name, $class, $ok, $fail) -ForegroundColor Green
     }
-    Write-Host ("  Set '{0}' to {1} priority ({2} process(es) changed, {3} failed)." -f $target.Name, $class, $ok, $fail) -ForegroundColor Green
-    Write-Host '  This lasts until the program is restarted.' -ForegroundColor DarkGray
+    Write-Host '  This lasts until those programs are restarted.' -ForegroundColor DarkGray
 }
 
 function Invoke-CloseCpuProgram {
-    $list = @(Show-TopCpuProcesses 20)
-    $target = Select-FromList $list 'close'
-    if (-not $target) { return }
-    [void](Stop-ProgramGroup $target)
+    Write-Host ''
+    Write-Host '  Measuring CPU usage for 1.5 seconds...' -ForegroundColor DarkGray
+    $list = @(Get-TopCpuProcesses 60)
+    $sel = @(Select-Programs $list 'Close CPU-heavy programs' 'CPU %' { param($p) "$($p.Cpu)%" } 'Close selected')
+    [void](Stop-ProgramGroups $sel)
 }
 
 # ---------------------------------------------------------------------------
@@ -427,6 +580,7 @@ function Invoke-TempClean {
 # ---------------------------------------------------------------------------
 $script:BrowserNames = 'msedge','chrome','firefox','brave','opera','opera_gx','vivaldi','iexplore'
 $script:BlockedCount = 0
+$script:SkipShared = @()
 $script:GenericNames = 'Microsoft','Microsoft Corporation','Windows','Common Files','Intel','Intel Corporation',
     'NVIDIA','NVIDIA Corporation','AMD','Advanced Micro Devices, Inc.','Google','Google LLC','Mozilla',
     'Packages','Temp','Programs','Apple','Apple Inc.','Adobe','Adobe Inc.','Steam','Realtek','Dell','HP',
@@ -586,7 +740,7 @@ function Get-AppFolder($app) {
 # Returns the name of another installed app that lives in this folder (so we don't delete it).
 function Test-FolderShared([string]$folder, $app, $all) {
     foreach ($o in $all) {
-        if ($o.Type -ne 'Desktop' -or $o.Name -eq $app.Name) { continue }
+        if ($o.Type -ne 'Desktop' -or $o.Name -eq $app.Name -or ($script:SkipShared -contains $o.Name)) { continue }
         foreach ($p in @($o.InstallLocation, $o.UninstallString, $o.DisplayIcon)) {
             if (-not $p) { continue }
             $q = [Environment]::ExpandEnvironmentVariables($p).Trim().Trim('"')
@@ -881,31 +1035,24 @@ function Invoke-Uninstaller {
     Write-Host ''
     Write-Host '  Loading installed apps...' -ForegroundColor DarkGray
     $all = @(Get-InstalledApps)
-    $target = $null
-    while (-not $target) {
-        Write-Host ''
-        $q = Read-Host '  Type part of an app name to search (blank = show all, Q = back)'
-        if ($q -match '^[Qq]$') { return }
-        $list = @($all | Where-Object { -not $q -or (Test-Contains $_.Name $q) -or (Test-Contains $_.Publisher $q) })
-        if ($list.Count -eq 0) { Write-Host '  No apps match that search.' -ForegroundColor Yellow; continue }
-        Show-AppList $list
-        Write-Host ''
-        $choice = Read-Host '  Enter the # of the app to uninstall (blank = search again)'
-        $n = 0
-        if ([int]::TryParse($choice, [ref]$n) -and $n -ge 1 -and $n -le $list.Count) { $target = $list[$n - 1] }
-    }
+    $rows = @(foreach ($a in $all) {
+        $size = ''
+        if ($a.SizeMB) { $size = '{0:N0} MB' -f $a.SizeMB }
+        , @($a.Name, $a.Type, $a.Publisher, $a.Version, $size)
+    })
+    $idx = @(Show-Picker -Title 'Uninstall apps' -Headers @('Name', 'Type', 'Publisher', 'Version', 'Size') `
+                -Widths @(330, 70, 220, 110, 80) -Rows $rows -OkText 'Uninstall selected' `
+                -Hint 'Tick every app you want to remove (use Search to find them), then click "Uninstall selected".')
+    if ($idx.Count -eq 0) { Write-Host '  Nothing selected.'; return }
+    $targets = @(foreach ($i in $idx) { $all[$i] })
+    $script:SkipShared = @($targets | ForEach-Object { $_.Name })
 
-    $folder = $null
-    if ($target.Type -eq 'Desktop') { $folder = Get-AppFolder $target }
     Write-Host ''
-    Write-Host ("  App:       {0}" -f $target.Name) -ForegroundColor Cyan
-    Write-Host ("  Publisher: {0}" -f $target.Publisher)
-    Write-Host ("  Version:   {0}" -f $target.Version)
-    Write-Host ("  Type:      {0}" -f $target.Type)
-    if ($folder) { Write-Host ("  Folder:    {0}" -f $folder) }
+    Write-Host ("  Selected {0} app(s):" -f $targets.Count) -ForegroundColor Cyan
+    foreach ($t in $targets) { Write-Host ("   - {0}  [{1}]" -f $t.Name, $t.Type) }
     Write-Host ''
     Write-Host '  1) Uninstall silently, then remove leftovers (recommended)'
-    Write-Host '  2) Force remove - skip the app''s uninstaller (for broken / stubborn apps)'
+    Write-Host '  2) Force remove - skip the apps'' uninstallers (for broken / stubborn apps)'
     $mode = Read-Host '  Choose (blank = cancel)'
     if ($mode -notin '1', '2') { Write-Host '  Cancelled.'; return }
 
@@ -914,7 +1061,7 @@ function Invoke-Uninstaller {
         if ($rp -notmatch '^[Nn]') {
             Write-Host '  Creating restore point (this can take a minute)...' -ForegroundColor DarkGray
             try {
-                Checkpoint-Computer -Description ("Before removing {0}" -f (Limit-Text $target.Name 40)) -RestorePointType APPLICATION_UNINSTALL -ErrorAction Stop
+                Checkpoint-Computer -Description 'Before RAM Cleaner uninstall' -RestorePointType APPLICATION_UNINSTALL -ErrorAction Stop
                 Write-Host '  [OK]   Restore point created.' -ForegroundColor Green
             } catch {
                 Write-Host ("  [WARN] Could not create a restore point: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
@@ -924,37 +1071,44 @@ function Invoke-Uninstaller {
         }
     }
 
+    $leftovers = New-Object System.Collections.Generic.List[object]
     $script:BlockedCount = 0
-    Write-Host ''
-    if ($mode -eq '1' -or $target.Type -eq 'Store') {
-        [void](Invoke-AppUninstall $target $folder)
-    } else {
-        Write-Host '  Force mode: skipping the uninstaller.' -ForegroundColor Yellow
+    $n = 0
+    foreach ($t in $targets) {
+        $n++
+        Write-Host ''
+        Write-Host ("  [{0}/{1}] {2}" -f $n, $targets.Count, $t.Name) -ForegroundColor Cyan
+        $folder = $null
+        if ($t.Type -eq 'Desktop') { $folder = Get-AppFolder $t }
+        if ($mode -eq '1' -or $t.Type -eq 'Store') {
+            [void](Invoke-AppUninstall $t $folder)
+        } else {
+            Write-Host '  Force mode: skipping the uninstaller.' -ForegroundColor Yellow
+        }
+        foreach ($item in @(Find-Leftovers $t $all $folder)) {
+            $item | Add-Member -NotePropertyName App -NotePropertyValue $t.Name -Force
+            $leftovers.Add($item)
+        }
     }
     if ($script:BlockedCount -gt 0) {
-        Write-Host ("  Blocked {0} pop-up window(s) / app launch(es) from the uninstaller." -f $script:BlockedCount) -ForegroundColor Green
+        Write-Host ''
+        Write-Host ("  Blocked {0} pop-up window(s) / app launch(es) from the uninstallers." -f $script:BlockedCount) -ForegroundColor Green
     }
 
     Write-Host ''
-    Write-Host '  Scanning for leftovers...' -ForegroundColor Cyan
-    $items = @(Find-Leftovers $target $all $folder)
-    if ($items.Count -eq 0) {
-        Write-Host '  No leftovers found. All clean!' -ForegroundColor Green
-        return
-    }
-    Write-Host ''
-    Write-Host '  Found these leftovers:' -ForegroundColor Cyan
-    foreach ($i in $items) {
+    if ($leftovers.Count -eq 0) { Write-Host '  No leftovers found. All clean!' -ForegroundColor Green; return }
+    Write-Host ("  Found {0} leftover item(s). Review them in the window (all are ticked)..." -f $leftovers.Count) -ForegroundColor Cyan
+    $lrows = @(foreach ($i in $leftovers) {
         $shown = $i.Target
         if ($i.Kind -eq 'RegKey') { $shown = $shown -replace '^Microsoft\.PowerShell\.Core\\Registry::', '' }
-        if ($i.Kind -in 'Task', 'RunValue', 'Service') { $shown = '' }
-        Write-Host ("   - {0}" -f $i.Desc)
-        if ($shown) { Write-Host ("       {0}" -f $shown) -ForegroundColor DarkGray }
-    }
-    Write-Host ''
-    $ok = Read-Host '  Delete all of these? (y/N)'
-    if ($ok -notmatch '^[Yy]') { Write-Host '  Leftovers kept.'; return }
-    Remove-Leftovers $items
+        if ($i.Kind -in 'Task', 'RunValue', 'Service') { $shown = ($shown -split '\|')[-1] }
+        , @($i.App, $i.Desc, $shown)
+    })
+    $lidx = @(Show-Picker -Title 'Remove leftovers' -Headers @('App', 'What', 'Location') -Widths @(200, 260, 400) `
+                -Rows $lrows -OkText 'Delete selected' -CheckAll $true `
+                -Hint 'Untick anything you want to keep, then click "Delete selected".')
+    if ($lidx.Count -eq 0) { Write-Host '  Leftovers kept.'; return }
+    Remove-Leftovers @(foreach ($i in $lidx) { $leftovers[$i] })
 }
 
 # ---------------------------------------------------------------------------
@@ -1035,13 +1189,13 @@ function Invoke-AutoMenu {
     $c = Read-Host '  Choose (blank = back)'
     switch ($c) {
         '1' {
-            $t = Read-Number 'Clean when RAM use goes above what %?' 85 50 98
+            $t = Read-Number 'Clean when RAM use goes above what %?' 60 40 98
             $i = Read-Number 'Check every how many seconds?' 60 15 3600
             Start-AutoClean $t $i $false
         }
         '2' {
             if (-not (Test-IsAdmin)) { Write-Host '  This needs Administrator rights. Run RamCleaner.bat and click Yes.' -ForegroundColor Yellow; return }
-            $t = Read-Number 'Clean when RAM use goes above what %?' 85 50 98
+            $t = Read-Number 'Clean when RAM use goes above what %?' 60 40 98
             $i = Read-Number 'Check every how many seconds?' 60 15 3600
             $scriptFile = $PSCommandPath
             Write-Host ''
@@ -1163,6 +1317,226 @@ function Invoke-LeakFinder {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Crash fixer: diagnoses why apps / browsers crash and fixes common causes
+# ---------------------------------------------------------------------------
+$script:BrowserCacheRoots = @(
+    @{ Name = 'Chrome';   Path = "$env:LOCALAPPDATA\Google\Chrome\User Data";                Proc = 'chrome' },
+    @{ Name = 'Edge';     Path = "$env:LOCALAPPDATA\Microsoft\Edge\User Data";               Proc = 'msedge' },
+    @{ Name = 'Brave';    Path = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data";  Proc = 'brave' },
+    @{ Name = 'Vivaldi';  Path = "$env:LOCALAPPDATA\Vivaldi\User Data";                      Proc = 'vivaldi' },
+    @{ Name = 'Opera';    Path = "$env:APPDATA\Opera Software\Opera Stable";                 Proc = 'opera' },
+    @{ Name = 'Opera';    Path = "$env:LOCALAPPDATA\Opera Software\Opera Stable";            Proc = 'opera' },
+    @{ Name = 'Opera GX'; Path = "$env:APPDATA\Opera Software\Opera GX Stable";              Proc = 'opera' },
+    @{ Name = 'Opera GX'; Path = "$env:LOCALAPPDATA\Opera Software\Opera GX Stable";         Proc = 'opera' }
+)
+
+function Clear-FolderContents([string]$path) {
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return 0 }
+    $before = Get-FolderSize $path
+    Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return [math]::Max(0, $before - (Get-FolderSize $path))
+}
+
+function Get-CommitInfo {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $total = [double]$os.TotalVirtualMemorySize * 1KB
+    $free  = [double]$os.FreeVirtualMemory * 1KB
+    [pscustomobject]@{ Total = $total; Used = $total - $free; Percent = [math]::Round((($total - $free) / $total) * 100, 1) }
+}
+
+function Get-PageFileInfo {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $pf = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue)
+    [pscustomobject]@{
+        Auto   = [bool]$cs.AutomaticManagedPagefile
+        Count  = $pf.Count
+        SizeMB = [double]($pf | Measure-Object AllocatedBaseSize -Sum).Sum
+        PeakMB = [double]($pf | Measure-Object PeakUsage -Sum).Sum
+        RamMB  = [math]::Round([double]$cs.TotalPhysicalMemory / 1MB)
+    }
+}
+
+function Close-Browsers([string[]]$procNames) {
+    $running = @(Get-Process -Name $procNames -ErrorAction SilentlyContinue)
+    if ($running.Count -eq 0) { return $true }
+    $names = ($running | Select-Object -ExpandProperty ProcessName -Unique) -join ', '
+    Write-Host ("  These browsers are open and must be closed first: {0}" -f $names) -ForegroundColor Yellow
+    Write-Host '  (Your tabs can be restored when you reopen them - passwords, history and logins are NOT touched.)' -ForegroundColor DarkGray
+    $ok = Read-Host '  Close them now? (y/N)'
+    if ($ok -notmatch '^[Yy]') { return $false }
+    foreach ($p in $running) { try { [void]$p.CloseMainWindow() } catch { } }
+    Start-Sleep -Seconds 3
+    Get-Process -Name $procNames -ErrorAction SilentlyContinue | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch { } }
+    Start-Sleep -Seconds 1
+    return $true
+}
+
+function Clear-BrowserCaches {
+    $present = @($script:BrowserCacheRoots | Where-Object { Test-Path -LiteralPath $_.Path })
+    if ($present.Count -eq 0) { Write-Host '  No supported browsers found.'; return }
+    $ffProfiles = Join-Path $env:LOCALAPPDATA 'Mozilla\Firefox\Profiles'
+    $procs = @($present | ForEach-Object { $_.Proc }) + 'firefox' | Select-Object -Unique
+    Write-Host ''
+    Write-Host '  Clearing browser caches (only cached files - not passwords, history, cookies or bookmarks)...' -ForegroundColor Cyan
+    if (-not (Close-Browsers $procs)) { Write-Host '  Cancelled.'; return }
+
+    $profileCaches = 'Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache'
+    $rootCaches = 'ShaderCache', 'GrShaderCache', 'GraphiteDawnCache'
+    $results = @{}
+    foreach ($b in $present) {
+        $freed = 0
+        foreach ($rc in $rootCaches) { $freed += Clear-FolderContents (Join-Path $b.Path $rc) }
+        $profiles = @(Get-Item -LiteralPath $b.Path) + @(Get-ChildItem -LiteralPath $b.Path -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' -or $_.Name -eq 'Guest Profile' })
+        foreach ($pdir in $profiles) {
+            foreach ($pc in $profileCaches) { $freed += Clear-FolderContents (Join-Path $pdir.FullName $pc) }
+        }
+        $results[$b.Name] = [double]$results[$b.Name] + $freed
+    }
+    if (Test-Path -LiteralPath $ffProfiles) {
+        $freed = 0
+        foreach ($pdir in Get-ChildItem -LiteralPath $ffProfiles -Directory -ErrorAction SilentlyContinue) {
+            foreach ($pc in 'cache2', 'startupCache', 'thumbnails', 'jumpListCache') { $freed += Clear-FolderContents (Join-Path $pdir.FullName $pc) }
+        }
+        $results['Firefox'] = $freed
+    }
+    foreach ($k in $results.Keys) { Write-Host ("  [OK]   {0,-10} cache cleared, freed {1}" -f $k, (Format-Size $results[$k])) -ForegroundColor Green }
+}
+
+function Clear-GpuCaches {
+    Write-Host ''
+    Write-Host '  Clearing graphics (shader) caches - they rebuild automatically...' -ForegroundColor Cyan
+    $low = Join-Path $env:USERPROFILE 'AppData\LocalLow'
+    $paths = @(
+        "$env:LOCALAPPDATA\D3DSCache", "$env:LOCALAPPDATA\NVIDIA\DXCache", "$env:LOCALAPPDATA\NVIDIA\GLCache",
+        "$low\NVIDIA\PerDriverVersion\DXCache", "$env:ProgramData\NVIDIA Corporation\NV_Cache",
+        "$env:LOCALAPPDATA\AMD\DxCache", "$env:LOCALAPPDATA\AMD\DxcCache", "$env:LOCALAPPDATA\AMD\GLCache",
+        "$env:LOCALAPPDATA\AMD\VkCache", "$low\AMD\DxCache", "$low\Intel\ShaderCache"
+    )
+    $total = 0
+    foreach ($p in $paths) {
+        if (Test-Path -LiteralPath $p) {
+            $f = Clear-FolderContents $p; $total += $f
+            Write-Host ("  [OK]   {0}  ({1})" -f $p, (Format-Size $f)) -ForegroundColor Green
+        }
+    }
+    Write-Host ("  Freed {0}. Files in use were skipped - close games/apps and run again to clear those." -f (Format-Size $total))
+}
+
+function Set-PageFileAuto {
+    if (-not (Test-IsAdmin)) { Write-Host '  This needs Administrator rights. Run RamCleaner.bat and click Yes.' -ForegroundColor Yellow; return }
+    $pf = Get-PageFileInfo
+    $freeC = [double](Get-PSDrive -Name ($env:SystemDrive.TrimEnd(':'))).Free
+    if ($freeC -lt 10GB) {
+        Write-Host ("  Warning: only {0} free on {1}. The page file needs room to grow - free up disk space too (option 8)." -f (Format-Size $freeC), $env:SystemDrive) -ForegroundColor Yellow
+    }
+    if ($pf.Auto) { Write-Host ("  [OK]   Virtual memory is already managed by Windows ({0:N0} MB right now)." -f $pf.SizeMB) -ForegroundColor Green; return }
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem
+        Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $true } -ErrorAction Stop
+        Write-Host '  [OK]   Virtual memory set to "System managed". RESTART your PC for it to take effect.' -ForegroundColor Green
+    } catch {
+        Write-Host ("  [FAIL] {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
+}
+
+function Invoke-CrashDiagnose {
+    Write-Host ''
+    Write-Host '  Checking the last 7 days of crash reports...' -ForegroundColor DarkGray
+    $since = (Get-Date).AddDays(-7)
+    $crashes = @(); $lowMem = @()
+    try { $crashes = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = $since } -ErrorAction Stop) } catch { }
+    try { $lowMem = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Resource-Exhaustion-Detector'; Id = 2004; StartTime = $since } -ErrorAction Stop) } catch { }
+
+    $rows = @($crashes | ForEach-Object {
+        [pscustomobject]@{ App = [string]$_.Properties[0].Value; Module = [string]$_.Properties[3].Value; Code = [string]$_.Properties[6].Value; Time = $_.TimeCreated }
+    })
+    $rec = [ordered]@{}
+
+    Write-Host ''
+    Write-Host '  APP CRASHES (last 7 days)' -ForegroundColor Cyan
+    if ($rows.Count -eq 0) {
+        Write-Host '  No crashes recorded by Windows.' -ForegroundColor Green
+    } else {
+        Write-Host ('  {0,-26} {1,-26} {2,-11} {3,6}  {4}' -f 'Program', 'Crashed in', 'Error', 'Times', 'Last')
+        Write-Host ('  ' + ('-' * 90)) -ForegroundColor DarkGray
+        $rows | Group-Object { "$($_.App)|$($_.Module)" } | Sort-Object Count -Descending | Select-Object -First 15 | ForEach-Object {
+            $f = $_.Group | Sort-Object Time -Descending | Select-Object -First 1
+            Write-Host ('  {0,-26} {1,-26} {2,-11} {3,6}  {4:dd MMM HH:mm}' -f (Limit-Text $f.App 26), (Limit-Text $f.Module 26), $f.Code, $_.Count, $f.Time)
+        }
+        if ($rows | Where-Object { $_.App -match '^(chrome|msedge|firefox|brave|opera|vivaldi)\.exe$' }) { $rec['browser'] = $true }
+        if ($rows | Where-Object { $_.Module -match '^(nvwgf|nvd3d|nvoglv|nvlddmkm|atidxx|atiumd|atig6|amdxx|amdxc|amdvlk|igd|igxel|ig\d|d3d1[012]|dxgi|libGLESv2|vulkan)' }) { $rec['gpu'] = $true }
+        $distinctApps = @($rows | Select-Object -ExpandProperty App -Unique).Count
+        if ($distinctApps -ge 4) { $rec['ram'] = $true }
+    }
+
+    Write-Host ''
+    Write-Host '  MEMORY HEALTH' -ForegroundColor Cyan
+    $commit = Get-CommitInfo
+    $pf = Get-PageFileInfo
+    Write-Host ("  Committed memory: {0} of {1} ({2}%)  - apps crash when this reaches 100%" -f (Format-Size $commit.Used), (Format-Size $commit.Total), $commit.Percent)
+    if ($pf.Count -eq 0) {
+        Write-Host '  Page file (virtual memory): OFF  <-- apps and browsers crash when RAM fills up' -ForegroundColor Red
+        $rec['pagefile'] = $true
+    } elseif (-not $pf.Auto -and $pf.SizeMB -lt [math]::Min($pf.RamMB, 16384)) {
+        Write-Host ("  Page file: {0:N0} MB, fixed size - too small for {1:N0} MB of RAM" -f $pf.SizeMB, $pf.RamMB) -ForegroundColor Red
+        $rec['pagefile'] = $true
+    } else {
+        $mode = if ($pf.Auto) { 'managed by Windows' } else { 'custom size' }
+        Write-Host ("  Page file: {0:N0} MB, {1} - OK" -f $pf.SizeMB, $mode) -ForegroundColor Green
+    }
+    if ($lowMem.Count -gt 0) {
+        Write-Host ("  Windows ran OUT OF MEMORY {0} time(s) this week - this is what makes apps crash." -f $lowMem.Count) -ForegroundColor Red
+        $rec['pagefile'] = $true
+    } else {
+        Write-Host '  No out-of-memory events this week.' -ForegroundColor Green
+    }
+    if ($commit.Percent -ge 85) { Write-Host '  Committed memory is very high right now - close some programs.' -ForegroundColor Yellow }
+
+    Write-Host ''
+    Write-Host '  WHAT TO DO' -ForegroundColor Cyan
+    if ($rec.Count -eq 0) {
+        Write-Host '  Nothing obvious found. If something still crashes, update it and your graphics driver.' -ForegroundColor Green
+        return
+    }
+    if ($rec['pagefile']) { Write-Host '  - Fix virtual memory (option 4): lets Windows use disk as backup when RAM is full instead of crashing apps.' }
+    if ($rec['browser'])  { Write-Host '  - Clear browser caches (option 2): corrupted cache files are a common cause of browser crashes.' }
+    if ($rec['gpu'])      { Write-Host '  - Crashes are inside the graphics driver: clear GPU caches (option 3) and update your graphics driver.' }
+    if ($rec['ram'])      { Write-Host '  - Many different programs are crashing: test your RAM (option 5). If you use XMP/EXPO or overclocking in BIOS, try turning it off.' }
+    Write-Host ''
+    $go = Read-Host '  Apply the recommended fixes now? (y/N)'
+    if ($go -notmatch '^[Yy]') { return }
+    if ($rec['pagefile']) { Set-PageFileAuto }
+    if ($rec['browser'])  { Clear-BrowserCaches }
+    if ($rec['gpu'])      { Clear-GpuCaches }
+    if ($rec['ram'])      { Write-Host ''; Write-Host '  RAM test: use option 5 when you are ready to restart.' -ForegroundColor Yellow }
+}
+
+function Invoke-CrashMenu {
+    Write-Host ''
+    Write-Host '  FIX APP / BROWSER CRASHES' -ForegroundColor Cyan
+    Write-Host '  1) Diagnose - find out why things are crashing (recommended first)'
+    Write-Host '  2) Clear browser caches (Chrome, Edge, Firefox, Brave, Opera, Vivaldi)'
+    Write-Host '  3) Clear graphics driver shader caches (NVIDIA / AMD / Intel / DirectX)'
+    Write-Host '  4) Fix virtual memory - set the page file to "System managed" [Admin]'
+    Write-Host '  5) Test RAM for hardware errors (Windows Memory Diagnostic - restarts the PC)'
+    $c = Read-Host '  Choose (blank = back)'
+    switch ($c) {
+        '1' { Invoke-CrashDiagnose }
+        '2' { Clear-BrowserCaches }
+        '3' { Clear-GpuCaches }
+        '4' { Set-PageFileAuto }
+        '5' {
+            Write-Host '  Windows Memory Diagnostic will ask to restart now or on the next start-up.' -ForegroundColor Yellow
+            Write-Host '  The test takes 10-20 minutes; results appear after you log back in.' -ForegroundColor DarkGray
+            try { Start-Process mdsched.exe } catch { Write-Host '  Could not start it - search "Windows Memory Diagnostic" in the Start menu.' }
+        }
+    }
+}
+
 function Pause-Menu {
     Write-Host ''
     [void](Read-Host '  Press Enter to return to the menu')
@@ -1197,17 +1571,18 @@ while ($true) {
     Write-Host '  1) Show programs using the most RAM'
     Write-Host '  2) Quick Clean  (trim memory of all running programs)'
     Write-Host '  3) Deep Clean   (Quick Clean + clear standby cache) [Admin]'
-    Write-Host '  4) Close a program to free its memory'
+    Write-Host '  4) Close programs to free memory (tick several)'
     Write-Host '  --- CPU ---' -ForegroundColor Cyan
     Write-Host '  5) Show programs using the most CPU'
-    Write-Host '  6) Lower the priority of a CPU-heavy program'
-    Write-Host '  7) Close a CPU-heavy program'
+    Write-Host '  6) Lower the priority of CPU-heavy programs (tick several)'
+    Write-Host '  7) Close CPU-heavy programs (tick several)'
     Write-Host '  --- Other ---' -ForegroundColor Cyan
     Write-Host '  8) Clean temporary files'
     Write-Host '  9) Manage startup apps (stop apps loading at boot)'
     Write-Host '  U) Uninstall apps (silent, blocks pop-ups, removes leftovers)'
     Write-Host '  A) Auto-clean (keep RAM low automatically)'
     Write-Host '  L) Find what keeps filling RAM (leak finder)'
+    Write-Host '  F) Fix app / browser crashes'
     Write-Host '  R) Refresh'
     Write-Host '  0) Exit'
     Write-Host ''
@@ -1225,6 +1600,7 @@ while ($true) {
         'U' { Invoke-Uninstaller; Pause-Menu }
         'A' { Invoke-AutoMenu; Pause-Menu }
         'L' { Invoke-LeakFinder; Pause-Menu }
+        'F' { Invoke-CrashMenu; Pause-Menu }
         '0' { exit }
         default { }
     }

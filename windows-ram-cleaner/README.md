@@ -24,8 +24,22 @@ A small, dependency-free tool (PowerShell + a .bat launcher) to free up RAM and 
 | 7. Close a program (CPU) | Pick a program from the CPU list to close it. |
 | 8. Clean temp files | Deletes leftover temporary files (your user Temp folder, plus `C:\Windows\Temp` when run as admin). Files in use are skipped. |
 | 9. Startup apps | Opens Windows Settings → Startup apps so you can stop programs from loading at boot. |
+| U. Uninstall apps | Search installed apps (desktop + Microsoft Store), then remove one silently and clean up its leftovers. See below. |
 
 The header also shows live RAM and CPU usage bars; press **R** to refresh them.
+
+## Uninstaller (option U)
+
+1. Search by name (or leave blank to list everything) and pick the app.
+2. Choose a mode:
+   - **Uninstall silently + remove leftovers** - runs the app's own uninstaller in silent mode (MSI `/qn`, Inno Setup `/VERYSILENT`, NSIS `/S`, Squirrel `-s`, or the app's own quiet command). Any browser window or app the uninstaller tries to open (feedback pages, surveys, "are you sure?" apps) is closed automatically.
+   - **Force remove** - for broken apps whose uninstaller is missing or refuses to work. Skips the uninstaller entirely.
+3. When running as admin, it offers to create a **System Restore point** first.
+4. It then scans for leftovers - install folder, data folders in AppData / ProgramData, services, scheduled tasks, startup entries, shortcuts, and registry keys - shows you the full list, and deletes them only after you confirm.
+
+Safety: system folders (Windows, Program Files root, your user folders, etc.) can never be deleted, and a folder that also contains another installed app is kept. Store apps are removed for all users and de-provisioned so they don't come back for new accounts (admin).
+
+Tip: close your browser before uninstalling - while the uninstaller runs, any *new* browser window that opens is closed.
 
 ## Command-line / scheduled use
 

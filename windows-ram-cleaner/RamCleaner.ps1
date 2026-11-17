@@ -11,6 +11,8 @@
                       purges the standby list / file cache (needs Admin)
       - Close a program you pick from the list
       - Open Windows "Startup apps" settings so fewer apps launch at boot
+      - Uninstall apps silently (no websites / pop-ups) and remove leftover
+        files, folders, services, scheduled tasks and registry entries
 
     Usage:
       Double-click RamCleaner.bat (recommended), or run in PowerShell:
@@ -417,6 +419,541 @@ function Invoke-TempClean {
     if (-not (Test-IsAdmin)) { Write-Host '  (Run as Administrator to also clean C:\Windows\Temp)' -ForegroundColor DarkGray }
 }
 
+# ---------------------------------------------------------------------------
+# Uninstaller (silent uninstall, pop-up blocking, leftover cleanup)
+# ---------------------------------------------------------------------------
+$script:BrowserNames = 'msedge','chrome','firefox','brave','opera','opera_gx','vivaldi','iexplore'
+$script:BlockedCount = 0
+$script:GenericNames = 'Microsoft','Microsoft Corporation','Windows','Common Files','Intel','Intel Corporation',
+    'NVIDIA','NVIDIA Corporation','AMD','Advanced Micro Devices, Inc.','Google','Google LLC','Mozilla',
+    'Packages','Temp','Programs','Apple','Apple Inc.','Adobe','Adobe Inc.','Steam','Realtek','Dell','HP',
+    'Lenovo','ASUS','Package Cache','Installer','Program Files','Program Files (x86)','ProgramData',
+    'Users','AppData','Local','Roaming','Default','Update','Updater','Uninstall','Setup','Tools','Driver','Drivers'
+
+function Test-Contains([string]$hay, [string]$needle) {
+    if (-not $hay -or -not $needle) { return $false }
+    return $hay.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Test-InFolder([string]$path, [string]$folder) {
+    if (-not $path -or -not $folder) { return $false }
+    $f = $folder.TrimEnd('\')
+    return ($path.TrimEnd('\') -ieq $f) -or $path.StartsWith($f + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Limit-Text([string]$s, [int]$n) {
+    if (-not $s) { return '' }
+    if ($s.Length -gt $n) { return $s.Substring(0, $n - 1) + '~' }
+    return $s
+}
+
+function Get-CleanAppName([string]$name) {
+    $n = $name -replace '\s*\((x64|x86|64-bit|32-bit|64 bit|32 bit)\)', ''
+    $n = $n -replace '\s+v?\d+(\.\d+)+.*$', ''
+    $n = $n -replace '\s+(x64|x86)$', ''
+    return $n.Trim()
+}
+
+# Never allow deleting system or shared top-level folders.
+function Test-SafeToDelete([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    try { $full = [IO.Path]::GetFullPath($path.Trim().Trim('"')).TrimEnd('\') } catch { return $false }
+    if ($full.Length -le 3) { return $false }   # drive root
+    $protected = @($env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:ProgramData,
+        (Split-Path $env:USERPROFILE -Parent), $env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA,
+        (Join-Path $env:LOCALAPPDATA 'Programs'), (Join-Path $env:LOCALAPPDATA 'Packages'), $env:TEMP,
+        (Join-Path $env:ProgramFiles 'Common Files'), (Join-Path $env:ProgramFiles 'WindowsApps'),
+        [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('MyDocuments'),
+        [Environment]::GetFolderPath('StartMenu'), [Environment]::GetFolderPath('CommonStartMenu'),
+        [Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms'),
+        (Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'OneDrive'))
+    if (${env:ProgramFiles(x86)}) { $protected += (Join-Path ${env:ProgramFiles(x86)} 'Common Files') }
+    foreach ($p in $protected) { if ($p -and ($full -ieq $p.TrimEnd('\'))) { return $false } }
+    if (Test-InFolder $full $env:WINDIR) { return $false }
+    if (Test-InFolder $full (Join-Path $env:ProgramFiles 'WindowsApps')) { return $false }
+    return $true
+}
+
+function Get-InstalledApps {
+    $apps = New-Object System.Collections.Generic.List[object]
+    $keys = @(
+        @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall';             Scope = 'All users' },
+        @{ Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; Scope = 'All users' },
+        @{ Path = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall';             Scope = 'Current user' }
+    )
+    foreach ($k in $keys) {
+        if (-not (Test-Path $k.Path)) { continue }
+        foreach ($sub in Get-ChildItem $k.Path -ErrorAction SilentlyContinue) {
+            try { $p = Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction Stop } catch { continue }
+            if (-not $p.DisplayName) { continue }
+            if ($p.SystemComponent -eq 1) { continue }
+            if ($p.ParentKeyName -or ($p.ReleaseType -match 'Update|Hotfix')) { continue }
+            $size = $null
+            if ($p.EstimatedSize) { $size = [math]::Round([double]$p.EstimatedSize / 1024) }
+            $apps.Add([pscustomobject]@{
+                Type                 = 'Desktop'
+                Name                 = ([string]$p.DisplayName).Trim()
+                Publisher            = [string]$p.Publisher
+                Version              = [string]$p.DisplayVersion
+                SizeMB               = $size
+                UninstallString      = [string]$p.UninstallString
+                QuietUninstallString = [string]$p.QuietUninstallString
+                InstallLocation      = [string]$p.InstallLocation
+                DisplayIcon          = [string]$p.DisplayIcon
+                IsMsi                = ($p.WindowsInstaller -eq 1)
+                KeyName              = $sub.PSChildName
+                RegPath              = $sub.PSPath
+                Package              = $null
+            })
+        }
+    }
+    try {
+        foreach ($pkg in Get-AppxPackage -ErrorAction Stop) {
+            if ($pkg.IsFramework -or $pkg.NonRemovable -or $pkg.IsResourcePackage -or $pkg.SignatureKind -eq 'System') { continue }
+            $apps.Add([pscustomobject]@{
+                Type = 'Store'; Name = $pkg.Name; Publisher = ($pkg.Publisher -replace '^CN=([^,]+).*$', '$1')
+                Version = [string]$pkg.Version; SizeMB = $null; UninstallString = $null; QuietUninstallString = $null
+                InstallLocation = $pkg.InstallLocation; DisplayIcon = $null; IsMsi = $false
+                KeyName = $null; RegPath = $null; Package = $pkg
+            })
+        }
+    } catch { }
+    $apps | Group-Object { "$($_.Type)|$($_.Name)" } | ForEach-Object { $_.Group[0] } | Sort-Object Name
+}
+
+function Show-AppList($list) {
+    Write-Host ''
+    Write-Host ('  {0,-4} {1,-44} {2,-7} {3,-24} {4,8}' -f '#', 'Name', 'Type', 'Publisher', 'Size')
+    Write-Host ('  ' + ('-' * 91)) -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $a = $list[$i]
+        $size = ''
+        if ($a.SizeMB) { $size = '{0:N0} MB' -f $a.SizeMB }
+        Write-Host ('  {0,-4} {1,-44} {2,-7} {3,-24} {4,8}' -f ($i + 1), (Limit-Text $a.Name 44), $a.Type, (Limit-Text $a.Publisher 24), $size)
+    }
+}
+
+function Split-CommandLine([string]$cmd) {
+    $cmd = $cmd.Trim()
+    if ($cmd.StartsWith('"')) {
+        $end = $cmd.IndexOf('"', 1)
+        if ($end -gt 0) { return @($cmd.Substring(1, $end - 1), $cmd.Substring($end + 1).Trim()) }
+    }
+    $i = $cmd.ToLower().IndexOf('.exe')
+    if ($i -ge 0) { return @($cmd.Substring(0, $i + 4), $cmd.Substring($i + 4).Trim()) }
+    $parts = $cmd.Split(' ', 2)
+    if ($parts.Count -gt 1) { return @($parts[0], $parts[1]) }
+    return @($parts[0], '')
+}
+
+# Works out the silent switch for common installer types.
+function Get-SilentArgs([string]$exe, [string]$existing) {
+    $leaf = [IO.Path]::GetFileName($exe).ToLower()
+    if ($leaf -eq 'update.exe' -and $existing -match '--uninstall') { return '-s' }         # Squirrel (Discord, etc.)
+    if ($leaf -match '^unins\d{3}\.exe$') { return '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' } # Inno Setup
+    $text = ''
+    try {
+        $fi = Get-Item -LiteralPath $exe -ErrorAction Stop
+        if ($fi.Length -lt 30MB) { $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($fi.FullName)) }
+    } catch { }
+    if ($text -match 'Inno Setup') { return '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' }
+    if ($text -match 'Nullsoft|NSIS') { return ('/S _?=' + (Split-Path $exe -Parent)) }   # NSIS, run in place
+    return $null
+}
+
+function Get-AppFolder($app) {
+    $cands = @()
+    if ($app.InstallLocation) { $cands += $app.InstallLocation }
+    if ($app.UninstallString -and $app.UninstallString -notmatch 'msiexec|rundll32') {
+        $cands += (Split-Path ([Environment]::ExpandEnvironmentVariables((Split-CommandLine $app.UninstallString)[0])) -Parent)
+    }
+    if ($app.DisplayIcon) {
+        $icon = [Environment]::ExpandEnvironmentVariables((($app.DisplayIcon -split ',')[0]).Trim().Trim('"'))
+        if ($icon) { $cands += (Split-Path $icon -Parent) }
+    }
+    foreach ($c in $cands) {
+        if (-not $c) { continue }
+        $c = [Environment]::ExpandEnvironmentVariables($c.Trim().Trim('"')).TrimEnd('\')
+        if ($c -and (Test-SafeToDelete $c) -and -not (Test-InFolder $c $env:TEMP) -and
+            -not (Test-InFolder $c (Join-Path $env:ProgramData 'Package Cache'))) { return $c }
+    }
+    return $null
+}
+
+# Returns the name of another installed app that lives in this folder (so we don't delete it).
+function Test-FolderShared([string]$folder, $app, $all) {
+    foreach ($o in $all) {
+        if ($o.Type -ne 'Desktop' -or $o.Name -eq $app.Name) { continue }
+        foreach ($p in @($o.InstallLocation, $o.UninstallString, $o.DisplayIcon)) {
+            if (-not $p) { continue }
+            $q = [Environment]::ExpandEnvironmentVariables($p).Trim().Trim('"')
+            if (Test-InFolder $q $folder) { return $o.Name }
+        }
+    }
+    return $null
+}
+
+# Closes browser windows that were opened by the uninstaller (feedback pages, ads, surveys).
+function Stop-NewBrowsers($before) {
+    $filter = ($script:BrowserNames | ForEach-Object { "Name='$_.exe'" }) -join ' OR '
+    try { $procs = @(Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop) } catch { return }
+    $browserPids = @{}
+    foreach ($p in $procs) { $browserPids[[int]$p.ProcessId] = $true }
+    foreach ($p in $procs) {
+        $id = [int]$p.ProcessId
+        if ($before.ContainsKey($id)) { continue }
+        if ($browserPids.ContainsKey([int]$p.ParentProcessId)) { continue }   # child of a browser, not a new window
+        try { Stop-Process -Id $id -Force -ErrorAction Stop; $script:BlockedCount++ } catch { }
+    }
+}
+
+function Wait-Uninstaller($proc, $before, [string]$folder) {
+    $deadline = (Get-Date).AddMinutes(15)
+    while ((Get-Date) -lt $deadline) {
+        Stop-NewBrowsers $before
+        $running = $false
+        try { $running = -not $proc.HasExited } catch { $running = [bool](Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) }
+        if (-not $running) {
+            $new = @(Get-Process | Where-Object { -not $before.ContainsKey($_.Id) })
+            # Programs the uninstaller launched from the app folder (e.g. "are you sure?" app windows)
+            foreach ($p in $new) {
+                if ($folder -and $p.Path -and (Test-InFolder $p.Path $folder)) {
+                    try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $script:BlockedCount++ } catch { }
+                }
+            }
+            # Uninstallers that copy themselves to Temp and keep running there
+            $helpers = @($new | Where-Object {
+                ($_.Path -and (Test-InFolder $_.Path $env:TEMP)) -or ($_.ProcessName -match '^(Au_|Un_A|_iu|unins)')
+            })
+            if ($helpers.Count -eq 0) { break }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    for ($i = 0; $i -lt 8; $i++) { Stop-NewBrowsers $before; Start-Sleep -Milliseconds 500 }
+}
+
+function Invoke-AppUninstall($app, [string]$folder) {
+    if ($app.Type -eq 'Store') {
+        try {
+            if (Test-IsAdmin) {
+                try { Remove-AppxPackage -Package $app.Package.PackageFullName -AllUsers -ErrorAction Stop }
+                catch { Remove-AppxPackage -Package $app.Package.PackageFullName -ErrorAction Stop }
+                # Stop it from coming back for new user accounts
+                Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -eq $app.Name } |
+                    ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Null }
+            } else {
+                Remove-AppxPackage -Package $app.Package.PackageFullName -ErrorAction Stop
+            }
+            Write-Host '  [OK]   Store app removed.' -ForegroundColor Green
+            return $true
+        } catch {
+            Write-Host ("  [FAIL] {0}" -f $_.Exception.Message) -ForegroundColor Red
+            return $false
+        }
+    }
+
+    $guid = $null
+    if ($app.KeyName -match '^\{[0-9A-Fa-f\-]{36}\}$') { $guid = $app.KeyName }
+    elseif ($app.UninstallString -match '\{[0-9A-Fa-f\-]{36}\}') { $guid = $Matches[0] }
+
+    if ($guid -and ($app.IsMsi -or $app.UninstallString -match 'msiexec')) {
+        $exe = 'msiexec.exe'; $argList = "/x $guid /qn /norestart"
+        Write-Host '  Windows Installer package - removing silently...'
+    } elseif ($app.QuietUninstallString) {
+        $exe, $argList = Split-CommandLine $app.QuietUninstallString
+        Write-Host '  Using the app''s own silent uninstall command...'
+    } elseif ($app.UninstallString) {
+        $exe, $argList = Split-CommandLine $app.UninstallString
+        $exe = [Environment]::ExpandEnvironmentVariables($exe)
+        $silent = Get-SilentArgs $exe $argList
+        if ($silent) {
+            $argList = ($argList + ' ' + $silent).Trim()
+            Write-Host '  Silent mode detected - removing without any windows...'
+        } else {
+            Write-Host '  This uninstaller has no known silent mode, so its window will open.' -ForegroundColor Yellow
+            Write-Host '  Click through it. Any browser pop-ups it opens will be closed automatically.' -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host '  This app has no uninstaller registered. Use Force remove instead.' -ForegroundColor Yellow
+        return $false
+    }
+
+    $exe = [Environment]::ExpandEnvironmentVariables($exe.Trim('"'))
+    if ($exe.Contains('\') -and -not (Test-Path -LiteralPath $exe)) {
+        Write-Host ("  The uninstaller is missing ({0}) - the app is broken." -f $exe) -ForegroundColor Yellow
+        Write-Host '  Its leftovers will be removed in the next step.' -ForegroundColor Yellow
+        return $false
+    }
+
+    $before = @{}
+    foreach ($p in Get-Process) { $before[$p.Id] = $true }
+    try {
+        if ($argList) { $proc = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -ErrorAction Stop }
+        else          { $proc = Start-Process -FilePath $exe -PassThru -ErrorAction Stop }
+    } catch {
+        Write-Host ("  [FAIL] Could not start the uninstaller: {0}" -f $_.Exception.Message) -ForegroundColor Red
+        return $false
+    }
+    Write-Host '  Waiting for the uninstaller to finish...' -ForegroundColor DarkGray
+    Wait-Uninstaller $proc $before $folder
+
+    $code = $null
+    try { $code = $proc.ExitCode } catch { }
+    if ($exe -eq 'msiexec.exe' -and $code -notin 0, 1605, 3010, $null) {
+        Write-Host ("  [WARN] Windows Installer returned error {0}." -f $code) -ForegroundColor Yellow
+        return $false
+    }
+    if ($code -eq 3010) { Write-Host '  A restart is needed to finish removing this app.' -ForegroundColor Yellow }
+    Write-Host '  [OK]   Uninstaller finished.' -ForegroundColor Green
+    return $true
+}
+
+function Find-Leftovers($app, $all, [string]$folder) {
+    $items = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $add = {
+        param($kind, $target, $desc)
+        $key = "$kind|$target".ToLower()
+        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $items.Add([pscustomobject]@{ Kind = $kind; Target = $target; Desc = $desc }) }
+    }
+    $clean  = Get-CleanAppName $app.Name
+    $nameOk = ($clean.Length -ge 4) -and ($script:GenericNames -notcontains $clean)
+    $pub    = ([string]$app.Publisher).Trim()
+    $pubOk  = $pub -and ($script:GenericNames -notcontains $pub) -and ($pub.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -lt 0)
+
+    if ($app.Type -eq 'Store') {
+        $pkgData = Join-Path $env:LOCALAPPDATA ('Packages\' + $app.Package.PackageFamilyName)
+        if (Test-Path -LiteralPath $pkgData) { & $add 'Folder' $pkgData 'App data folder' }
+        return $items
+    }
+
+    if ($folder) {
+        $shared = Test-FolderShared $folder $app $all
+        if ($shared) {
+            Write-Host ("  Note: {0} also contains '{1}', so that folder will be kept." -f $folder, $shared) -ForegroundColor Yellow
+        } elseif (Test-Path -LiteralPath $folder) {
+            & $add 'Folder' $folder 'Install folder'
+        }
+    }
+
+    # Data folders named after the app
+    $names = @()
+    if ($nameOk) { $names += $clean }
+    if ($folder) {
+        $leaf = Split-Path $folder -Leaf
+        if ($leaf.Length -ge 4 -and $script:GenericNames -notcontains $leaf) { $names += $leaf }
+    }
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:APPDATA, $env:LOCALAPPDATA,
+               (Join-Path $env:LOCALAPPDATA 'Programs')) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($r in $roots) {
+        foreach ($n in ($names | Select-Object -Unique)) {
+            if ($n.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { continue }
+            $cands = @(Join-Path $r $n)
+            if ($pubOk) { $cands += (Join-Path (Join-Path $r $pub) $n) }
+            foreach ($c in $cands) {
+                if ((Test-Path -LiteralPath $c -PathType Container) -and (Test-SafeToDelete $c) -and -not (Test-FolderShared $c $app $all)) {
+                    & $add 'Folder' $c 'Leftover data folder'
+                }
+            }
+        }
+    }
+
+    # Services
+    if ($folder) {
+        try {
+            Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { Test-Contains $_.PathName $folder } |
+                ForEach-Object { & $add 'Service' $_.Name ("Service: {0}" -f $_.DisplayName) }
+        } catch { }
+    }
+
+    # Scheduled tasks (updaters, "helpers", etc.)
+    try {
+        $pattern = [WildcardPattern]::Escape(($clean -replace '\s', '')) + '*'
+        foreach ($t in Get-ScheduledTask -ErrorAction Stop) {
+            $hit = $false
+            foreach ($a in $t.Actions) {
+                if ($folder -and ((Test-Contains $a.Execute $folder) -or (Test-Contains $a.Arguments $folder))) { $hit = $true }
+            }
+            if (-not $hit -and $nameOk -and $t.TaskPath -notlike '\Microsoft\*' -and
+                (($t.TaskName -replace '\s', '') -like $pattern)) { $hit = $true }
+            if ($hit) { & $add 'Task' ($t.TaskPath + '|' + $t.TaskName) ("Scheduled task: {0}{1}" -f $t.TaskPath, $t.TaskName) }
+        }
+    } catch { }
+
+    # Startup entries
+    $runKeys = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+    foreach ($rk in $runKeys) {
+        if (-not (Test-Path $rk)) { continue }
+        $key = Get-Item $rk
+        foreach ($vn in $key.GetValueNames()) {
+            $val = [string]$key.GetValue($vn)
+            if (($folder -and (Test-Contains $val $folder)) -or ($nameOk -and $vn -ieq $clean)) {
+                & $add 'RunValue' "$rk|$vn" ("Startup entry: {0}" -f $vn)
+            }
+        }
+    }
+
+    # Shortcuts
+    $shell = $null
+    try { $shell = New-Object -ComObject WScript.Shell } catch { }
+    $lnkRoots = @([Environment]::GetFolderPath('StartMenu'), [Environment]::GetFolderPath('CommonStartMenu'),
+                  [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('CommonDesktopDirectory'))
+    foreach ($lr in $lnkRoots) {
+        if (-not $lr -or -not (Test-Path -LiteralPath $lr)) { continue }
+        if ($shell -and $folder) {
+            foreach ($l in Get-ChildItem -LiteralPath $lr -Recurse -Filter *.lnk -ErrorAction SilentlyContinue) {
+                $tp = $null
+                try { $tp = $shell.CreateShortcut($l.FullName).TargetPath } catch { }
+                if ($tp -and (Test-InFolder $tp $folder)) { & $add 'File' $l.FullName ("Shortcut: {0}" -f $l.Name) }
+            }
+        }
+        if ($nameOk -and $clean.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -lt 0) {
+            $sm = Join-Path $lr ('Programs\' + $clean)
+            if (Test-Path -LiteralPath $sm -PathType Container) { & $add 'Folder' $sm 'Start Menu folder' }
+        }
+    }
+
+    # Registry
+    if ($app.RegPath -and (Test-Path -LiteralPath $app.RegPath)) {
+        & $add 'RegKey' $app.RegPath 'Uninstall entry (removes it from the installed apps list)'
+    }
+    if ($nameOk) {
+        foreach ($hive in 'HKCU:\Software', 'HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\WOW6432Node') {
+            $cands = @("$hive\$clean")
+            if ($pubOk) { $cands += "$hive\$pub\$clean" }
+            foreach ($c in $cands) {
+                if (Test-Path -LiteralPath $c) { & $add 'RegKey' $c ("Registry: {0}" -f $c) }
+            }
+        }
+    }
+    return $items
+}
+
+function Remove-Leftovers($items) {
+    $order = @{ Service = 0; Task = 1; RunValue = 2; File = 3; RegKey = 4; Folder = 5 }
+    $items = @($items | Sort-Object { $order[$_.Kind] })
+
+    foreach ($i in $items | Where-Object Kind -eq 'Service') {
+        try { Stop-Service -Name $i.Target -Force -ErrorAction Stop } catch { }
+    }
+    foreach ($f in $items | Where-Object Kind -eq 'Folder') {
+        Get-Process | Where-Object { $_.Path -and (Test-InFolder $_.Path $f.Target) } |
+            ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch { } }
+    }
+    Start-Sleep -Milliseconds 500
+
+    $ok = 0; $fail = 0
+    foreach ($i in $items) {
+        try {
+            switch ($i.Kind) {
+                'Service'  { $out = & sc.exe delete $i.Target 2>&1; if ($LASTEXITCODE -ne 0) { throw ($out -join ' ') } }
+                'Task'     { $tp, $tn = $i.Target -split '\|', 2; Unregister-ScheduledTask -TaskPath $tp -TaskName $tn -Confirm:$false -ErrorAction Stop }
+                'RunValue' { $k, $v = $i.Target -split '\|', 2; Remove-ItemProperty -LiteralPath $k -Name $v -ErrorAction Stop }
+                'File'     { if (Test-Path -LiteralPath $i.Target) { Remove-Item -LiteralPath $i.Target -Force -ErrorAction Stop } }
+                'RegKey'   { if (Test-Path -LiteralPath $i.Target) { Remove-Item -LiteralPath $i.Target -Recurse -Force -ErrorAction Stop } }
+                'Folder'   { if (Test-Path -LiteralPath $i.Target) { Remove-Item -LiteralPath $i.Target -Recurse -Force -ErrorAction Stop } }
+            }
+            $ok++
+            Write-Host ("  [OK]   {0}" -f $i.Desc) -ForegroundColor Green
+        } catch {
+            $fail++
+            Write-Host ("  [FAIL] {0} - {1}" -f $i.Desc, $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+    Write-Host ''
+    Write-Host ("  Removed {0} item(s), {1} failed." -f $ok, $fail)
+    if ($fail -gt 0) {
+        Write-Host '  Some items are locked or need Administrator rights. Restart the PC and run this again to finish.' -ForegroundColor Yellow
+    }
+}
+
+function Invoke-Uninstaller {
+    if (-not (Test-IsAdmin)) {
+        Write-Host ''
+        Write-Host '  Tip: run as Administrator to remove apps installed for all users.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host '  Loading installed apps...' -ForegroundColor DarkGray
+    $all = @(Get-InstalledApps)
+    $target = $null
+    while (-not $target) {
+        Write-Host ''
+        $q = Read-Host '  Type part of an app name to search (blank = show all, Q = back)'
+        if ($q -match '^[Qq]$') { return }
+        $list = @($all | Where-Object { -not $q -or (Test-Contains $_.Name $q) -or (Test-Contains $_.Publisher $q) })
+        if ($list.Count -eq 0) { Write-Host '  No apps match that search.' -ForegroundColor Yellow; continue }
+        Show-AppList $list
+        Write-Host ''
+        $choice = Read-Host '  Enter the # of the app to uninstall (blank = search again)'
+        $n = 0
+        if ([int]::TryParse($choice, [ref]$n) -and $n -ge 1 -and $n -le $list.Count) { $target = $list[$n - 1] }
+    }
+
+    $folder = $null
+    if ($target.Type -eq 'Desktop') { $folder = Get-AppFolder $target }
+    Write-Host ''
+    Write-Host ("  App:       {0}" -f $target.Name) -ForegroundColor Cyan
+    Write-Host ("  Publisher: {0}" -f $target.Publisher)
+    Write-Host ("  Version:   {0}" -f $target.Version)
+    Write-Host ("  Type:      {0}" -f $target.Type)
+    if ($folder) { Write-Host ("  Folder:    {0}" -f $folder) }
+    Write-Host ''
+    Write-Host '  1) Uninstall silently, then remove leftovers (recommended)'
+    Write-Host '  2) Force remove - skip the app''s uninstaller (for broken / stubborn apps)'
+    $mode = Read-Host '  Choose (blank = cancel)'
+    if ($mode -notin '1', '2') { Write-Host '  Cancelled.'; return }
+
+    if (Test-IsAdmin) {
+        $rp = Read-Host '  Create a System Restore point first? (Y/n)'
+        if ($rp -notmatch '^[Nn]') {
+            Write-Host '  Creating restore point (this can take a minute)...' -ForegroundColor DarkGray
+            try {
+                Checkpoint-Computer -Description ("Before removing {0}" -f (Limit-Text $target.Name 40)) -RestorePointType APPLICATION_UNINSTALL -ErrorAction Stop
+                Write-Host '  [OK]   Restore point created.' -ForegroundColor Green
+            } catch {
+                Write-Host ("  [WARN] Could not create a restore point: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                $go = Read-Host '  Continue anyway? (y/N)'
+                if ($go -notmatch '^[Yy]') { Write-Host '  Cancelled.'; return }
+            }
+        }
+    }
+
+    $script:BlockedCount = 0
+    Write-Host ''
+    if ($mode -eq '1' -or $target.Type -eq 'Store') {
+        [void](Invoke-AppUninstall $target $folder)
+    } else {
+        Write-Host '  Force mode: skipping the uninstaller.' -ForegroundColor Yellow
+    }
+    if ($script:BlockedCount -gt 0) {
+        Write-Host ("  Blocked {0} pop-up window(s) / app launch(es) from the uninstaller." -f $script:BlockedCount) -ForegroundColor Green
+    }
+
+    Write-Host ''
+    Write-Host '  Scanning for leftovers...' -ForegroundColor Cyan
+    $items = @(Find-Leftovers $target $all $folder)
+    if ($items.Count -eq 0) {
+        Write-Host '  No leftovers found. All clean!' -ForegroundColor Green
+        return
+    }
+    Write-Host ''
+    Write-Host '  Found these leftovers:' -ForegroundColor Cyan
+    foreach ($i in $items) {
+        $shown = $i.Target
+        if ($i.Kind -eq 'RegKey') { $shown = $shown -replace '^Microsoft\.PowerShell\.Core\\Registry::', '' }
+        if ($i.Kind -in 'Task', 'RunValue', 'Service') { $shown = '' }
+        Write-Host ("   - {0}" -f $i.Desc)
+        if ($shown) { Write-Host ("       {0}" -f $shown) -ForegroundColor DarkGray }
+    }
+    Write-Host ''
+    $ok = Read-Host '  Delete all of these? (y/N)'
+    if ($ok -notmatch '^[Yy]') { Write-Host '  Leftovers kept.'; return }
+    Remove-Leftovers $items
+}
+
 function Pause-Menu {
     Write-Host ''
     [void](Read-Host '  Press Enter to return to the menu')
@@ -458,6 +995,7 @@ while ($true) {
     Write-Host '  --- Other ---' -ForegroundColor Cyan
     Write-Host '  8) Clean temporary files'
     Write-Host '  9) Manage startup apps (stop apps loading at boot)'
+    Write-Host '  U) Uninstall apps (silent, blocks pop-ups, removes leftovers)'
     Write-Host '  R) Refresh'
     Write-Host '  0) Exit'
     Write-Host ''
@@ -472,6 +1010,7 @@ while ($true) {
         '7' { Invoke-CloseCpuProgram; Pause-Menu }
         '8' { Invoke-TempClean; Pause-Menu }
         '9' { Start-Process 'ms-settings:startupapps'; Pause-Menu }
+        'U' { Invoke-Uninstaller; Pause-Menu }
         '0' { exit }
         default { }
     }

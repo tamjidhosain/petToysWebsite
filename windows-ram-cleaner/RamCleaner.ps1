@@ -250,32 +250,171 @@ function Report-Freed([double]$before, [double]$after) {
     }
 }
 
-function Invoke-CloseProgram {
-    $list = @(Show-TopProcesses 20)
+# ---------------------------------------------------------------------------
+# Shared: pick a program from a list and close it
+# ---------------------------------------------------------------------------
+$script:CriticalProcesses = 'csrss','wininit','winlogon','services','lsass','smss','svchost','System',
+    'Registry','dwm','explorer','MsMpEng','fontdrvhost','Memory Compression','powershell','pwsh',
+    'conhost','audiodg','sihost','ctfmon','spoolsv','WmiPrvSE','Idle','Secure System'
+
+function Select-FromList($list, [string]$action) {
     Write-Host ''
-    $choice = Read-Host '  Enter the # of the program to close (blank to cancel)'
-    if ([string]::IsNullOrWhiteSpace($choice)) { return }
+    $choice = Read-Host ("  Enter the # of the program to {0} (blank to cancel)" -f $action)
+    if ([string]::IsNullOrWhiteSpace($choice)) { return $null }
     $n = 0
     if (-not [int]::TryParse($choice, [ref]$n) -or $n -lt 1 -or $n -gt $list.Count) {
-        Write-Host '  Invalid choice.' -ForegroundColor Yellow; return
+        Write-Host '  Invalid choice.' -ForegroundColor Yellow; return $null
     }
     $target = $list[$n - 1]
-    $critical = 'csrss','wininit','winlogon','services','lsass','smss','svchost','System','Registry',
-                'dwm','explorer','MsMpEng','fontdrvhost','Memory Compression','powershell','pwsh','conhost'
-    if ($critical -contains $target.Name) {
-        Write-Host ("  '{0}' is a Windows system process and should not be closed." -f $target.Name) -ForegroundColor Red
-        return
+    if ($script:CriticalProcesses -contains $target.Name) {
+        Write-Host ("  '{0}' is a Windows system process and should not be touched." -f $target.Name) -ForegroundColor Red
+        return $null
     }
+    return $target
+}
+
+function Stop-ProgramGroup($target) {
     Write-Host ("  This will close ALL {0} '{1}' window(s)/process(es). Unsaved work will be lost." -f $target.Instances, $target.Name) -ForegroundColor Yellow
     $confirm = Read-Host '  Type Y to confirm'
-    if ($confirm -notmatch '^[Yy]') { Write-Host '  Cancelled.'; return }
-    $before = (Get-MemoryInfo).Available
+    if ($confirm -notmatch '^[Yy]') { Write-Host '  Cancelled.'; return $false }
     foreach ($id in $target.Ids) {
         try { Stop-Process -Id $id -Force -ErrorAction Stop } catch { }
     }
     Start-Sleep -Seconds 1
     Write-Host ("  Closed '{0}'." -f $target.Name) -ForegroundColor Green
-    Report-Freed $before (Get-MemoryInfo).Available
+    return $true
+}
+
+function Invoke-CloseProgram {
+    $list = @(Show-TopProcesses 20)
+    $target = Select-FromList $list 'close'
+    if (-not $target) { return }
+    $before = (Get-MemoryInfo).Available
+    if (Stop-ProgramGroup $target) { Report-Freed $before (Get-MemoryInfo).Available }
+}
+
+# ---------------------------------------------------------------------------
+# CPU tools
+# ---------------------------------------------------------------------------
+function Get-CpuLoad {
+    try {
+        $v = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
+        return [math]::Min(100, [double]$v)
+    } catch {
+        try { return [double](Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average }
+        catch { return $null }
+    }
+}
+
+function Show-CpuStatus {
+    $load = Get-CpuLoad
+    $cpu = $null
+    try { $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1 } catch { }
+    Write-Host ''
+    Write-Host '  CPU STATUS' -ForegroundColor Cyan
+    if ($null -ne $load) { Show-Bar ([math]::Round($load, 1)) }
+    if ($cpu) {
+        Write-Host ("  {0}  ({1} cores / {2} threads, {3} MHz)" -f $cpu.Name.Trim(), $cpu.NumberOfCores,
+            $cpu.NumberOfLogicalProcessors, $cpu.CurrentClockSpeed) -ForegroundColor DarkGray
+    }
+}
+
+# Measures CPU use per program over a short sample window.
+function Get-TopCpuProcesses([int]$count = 15, [int]$sampleMs = 1500) {
+    $cores = [Environment]::ProcessorCount
+    $first = @{}
+    foreach ($p in Get-Process) {
+        if ($p.Id -eq 0) { continue }
+        try { $first[$p.Id] = $p.TotalProcessorTime.TotalMilliseconds } catch { }
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Start-Sleep -Milliseconds $sampleMs
+    $elapsed = $sw.Elapsed.TotalMilliseconds
+    $rows = foreach ($p in Get-Process) {
+        if (-not $first.ContainsKey($p.Id)) { continue }
+        try { $t = $p.TotalProcessorTime.TotalMilliseconds } catch { continue }
+        if ($null -eq $t -or $null -eq $first[$p.Id]) { continue }
+        [pscustomobject]@{ Name = $p.ProcessName; Id = $p.Id; Cpu = ($t - $first[$p.Id]) / $elapsed / $cores * 100 }
+    }
+    $rows | Group-Object Name | ForEach-Object {
+        [pscustomobject]@{
+            Name      = $_.Name
+            Instances = $_.Count
+            Cpu       = [math]::Round(($_.Group | Measure-Object Cpu -Sum).Sum, 1)
+            Ids       = $_.Group.Id
+        }
+    } | Sort-Object Cpu -Descending | Select-Object -First $count
+}
+
+function Show-TopCpuProcesses([int]$count = 15) {
+    Write-Host ''
+    Write-Host '  Measuring CPU usage for 1.5 seconds...' -ForegroundColor DarkGray
+    $list = @(Get-TopCpuProcesses $count)
+    Write-Host ''
+    Write-Host '  PROGRAMS USING THE MOST CPU' -ForegroundColor Cyan
+    Write-Host ('  {0,-3} {1,-32} {2,6} {3,8}' -f '#', 'Program', 'Count', 'CPU %')
+    Write-Host ('  ' + ('-' * 52)) -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $p = $list[$i]
+        $color = if ($p.Cpu -ge 25) { 'Red' } elseif ($p.Cpu -ge 10) { 'Yellow' } else { 'Gray' }
+        Write-Host ('  {0,-3} {1,-32} {2,6} {3,7}%' -f ($i + 1), $p.Name, $p.Instances, $p.Cpu) -ForegroundColor $color
+    }
+    return $list
+}
+
+function Invoke-LowerPriority {
+    $list = @(Show-TopCpuProcesses 20)
+    $target = Select-FromList $list 'change priority of'
+    if (-not $target) { return }
+    Write-Host ''
+    Write-Host '  1) Below Normal  (gives other apps more CPU - recommended)'
+    Write-Host '  2) Idle / Low    (only runs when the CPU is otherwise free)'
+    Write-Host '  3) Normal        (restore default)'
+    $p = Read-Host '  Choose priority'
+    $class = switch ($p) { '1' { 'BelowNormal' } '2' { 'Idle' } '3' { 'Normal' } default { $null } }
+    if (-not $class) { Write-Host '  Cancelled.'; return }
+    $ok = 0; $fail = 0
+    foreach ($id in $target.Ids) {
+        try { (Get-Process -Id $id -ErrorAction Stop).PriorityClass = $class; $ok++ } catch { $fail++ }
+    }
+    Write-Host ("  Set '{0}' to {1} priority ({2} process(es) changed, {3} failed)." -f $target.Name, $class, $ok, $fail) -ForegroundColor Green
+    Write-Host '  This lasts until the program is restarted.' -ForegroundColor DarkGray
+}
+
+function Invoke-CloseCpuProgram {
+    $list = @(Show-TopCpuProcesses 20)
+    $target = Select-FromList $list 'close'
+    if (-not $target) { return }
+    [void](Stop-ProgramGroup $target)
+}
+
+# ---------------------------------------------------------------------------
+# Temp files
+# ---------------------------------------------------------------------------
+function Get-FolderSize([string]$path) {
+    if (-not (Test-Path $path)) { return 0 }
+    $s = (Get-ChildItem $path -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    if ($s) { return [double]$s } else { return 0 }
+}
+
+function Invoke-TempClean {
+    $folders = @($env:TEMP, (Join-Path $env:LOCALAPPDATA 'Temp'))
+    if (Test-IsAdmin) { $folders += (Join-Path $env:WINDIR 'Temp') }
+    $folders = $folders | Where-Object { $_ } | Select-Object -Unique
+    Write-Host ''
+    Write-Host '  Cleaning temporary files (files in use are skipped)...' -ForegroundColor Cyan
+    $total = 0
+    foreach ($f in $folders) {
+        $before = Get-FolderSize $f
+        Get-ChildItem $f -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $freed = [math]::Max(0, $before - (Get-FolderSize $f))
+        $total += $freed
+        Write-Host ("  {0,-45} freed {1}" -f $f, (Format-Size $freed))
+    }
+    Write-Host ("  Total disk space freed: {0}" -f (Format-Size $total)) -ForegroundColor Green
+    if (-not (Test-IsAdmin)) { Write-Host '  (Run as Administrator to also clean C:\Windows\Temp)' -ForegroundColor DarkGray }
 }
 
 function Pause-Menu {
@@ -292,12 +431,12 @@ if ($Quick) { Invoke-QuickClean; exit }
 # ---------------------------------------------------------------------------
 # Interactive menu
 # ---------------------------------------------------------------------------
-$Host.UI.RawUI.WindowTitle = 'RAM Cleaner'
+$Host.UI.RawUI.WindowTitle = 'RAM & CPU Cleaner'
 while ($true) {
     Clear-Host
     Write-Host ''
     Write-Host '  ===============================================' -ForegroundColor Cyan
-    Write-Host '                 RAM CLEANER for Windows'           -ForegroundColor Cyan
+    Write-Host '            RAM & CPU CLEANER for Windows'          -ForegroundColor Cyan
     Write-Host '  ===============================================' -ForegroundColor Cyan
     if (Test-IsAdmin) {
         Write-Host '  Running as Administrator - all features available' -ForegroundColor Green
@@ -305,12 +444,21 @@ while ($true) {
         Write-Host '  Not running as Administrator - Deep Clean disabled' -ForegroundColor Yellow
     }
     [void](Show-MemoryStatus)
+    Show-CpuStatus
     Write-Host ''
+    Write-Host '  --- RAM ---' -ForegroundColor Cyan
     Write-Host '  1) Show programs using the most RAM'
     Write-Host '  2) Quick Clean  (trim memory of all running programs)'
     Write-Host '  3) Deep Clean   (Quick Clean + clear standby cache) [Admin]'
     Write-Host '  4) Close a program to free its memory'
-    Write-Host '  5) Manage startup apps (stop apps loading at boot)'
+    Write-Host '  --- CPU ---' -ForegroundColor Cyan
+    Write-Host '  5) Show programs using the most CPU'
+    Write-Host '  6) Lower the priority of a CPU-heavy program'
+    Write-Host '  7) Close a CPU-heavy program'
+    Write-Host '  --- Other ---' -ForegroundColor Cyan
+    Write-Host '  8) Clean temporary files'
+    Write-Host '  9) Manage startup apps (stop apps loading at boot)'
+    Write-Host '  R) Refresh'
     Write-Host '  0) Exit'
     Write-Host ''
     $sel = Read-Host '  Choose an option'
@@ -319,7 +467,11 @@ while ($true) {
         '2' { Invoke-QuickClean; Pause-Menu }
         '3' { Invoke-QuickClean; Invoke-DeepClean; Pause-Menu }
         '4' { Invoke-CloseProgram; Pause-Menu }
-        '5' { Start-Process 'ms-settings:startupapps'; Pause-Menu }
+        '5' { [void](Show-TopCpuProcesses 20); Pause-Menu }
+        '6' { Invoke-LowerPriority; Pause-Menu }
+        '7' { Invoke-CloseCpuProgram; Pause-Menu }
+        '8' { Invoke-TempClean; Pause-Menu }
+        '9' { Start-Process 'ms-settings:startupapps'; Pause-Menu }
         '0' { exit }
         default { }
     }

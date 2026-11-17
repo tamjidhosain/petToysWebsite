@@ -1,6 +1,6 @@
-# RAM Cleaner for Windows
+# RAM & CPU Cleaner for Windows
 
-A small, dependency-free tool (PowerShell + a .bat launcher) to free up RAM on Windows 10 and 11.
+A small, dependency-free tool (PowerShell + a .bat launcher) to free up RAM and tame CPU usage on Windows 10 and 11.
 
 ## How to use
 
@@ -15,11 +15,17 @@ A small, dependency-free tool (PowerShell + a .bat launcher) to free up RAM on W
 
 | Option | What it does |
 |---|---|
-| 1. Show top programs | Lists the programs using the most RAM (grouped, e.g. all Chrome processes together). |
+| 1. Show top RAM programs | Lists the programs using the most RAM (grouped, e.g. all Chrome processes together). |
 | 2. Quick Clean | Trims the working set of every running program, moving memory they aren't actively using out of RAM. Programs keep running normally. |
-| 3. Deep Clean (Admin) | Quick Clean, then flushes the modified page list and purges the **standby list** (the file cache Windows keeps in RAM). Same thing tools like RAMMap's "Empty Standby List" do. |
-| 4. Close a program | Pick a program from the list to close it completely. This frees the most RAM. System processes are protected. |
-| 5. Startup apps | Opens Windows Settings → Startup apps so you can stop programs from loading at boot. |
+| 3. Deep Clean (Admin) | Quick Clean, then flushes the modified page list and purges the **standby list** (the file cache Windows keeps in RAM). |
+| 4. Close a program (RAM) | Pick a program from the RAM list to close it completely. System processes are protected. |
+| 5. Show top CPU programs | Measures CPU use for 1.5 seconds and lists the busiest programs (red = 25%+, yellow = 10%+). |
+| 6. Lower priority | Sets a CPU-heavy program to Below Normal or Idle priority so the rest of your PC stays responsive. Lasts until that program restarts. |
+| 7. Close a program (CPU) | Pick a program from the CPU list to close it. |
+| 8. Clean temp files | Deletes leftover temporary files (your user Temp folder, plus `C:\Windows\Temp` when run as admin). Files in use are skipped. |
+| 9. Startup apps | Opens Windows Settings → Startup apps so you can stop programs from loading at boot. |
+
+The header also shows live RAM and CPU usage bars; press **R** to refresh them.
 
 ## Command-line / scheduled use
 
